@@ -1,0 +1,25 @@
+# --- Secretos y credenciales (NUNCA subir) ---
+.streamlit/secrets.toml
+.streamlit/*secrets*.toml
+secrets.toml
+.env
+.env.*
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.log
+
+# --- Entornos virtuales ---
+venv/
+.venv/
+env/
+
+# --- Editores y sistema operativo ---
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

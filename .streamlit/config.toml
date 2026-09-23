@@ -1,0 +1,10 @@
+# Fuerza el tema claro para que la paleta de la UTP se vea igual
+# aunque el sistema operativo esté en modo oscuro.
+[theme]
+base = "light"
+primaryColor = "#D3052D"
+backgroundColor = "#111111"
+textColor = "#262626"
+
+[client]
+toolbarMode = "minimal"
