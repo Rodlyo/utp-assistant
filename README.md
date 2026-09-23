@@ -1,12 +1,12 @@
 # UTP Assistant
 
-Sistema interno de UTPConsult. Incluye landing page, registro, login y dashboard con métricas (fases 1 y 2).
+Sistema interno de UTPConsult. Incluye landing page, registro, login, dashboard con métricas, gestión de usuarios y procesamiento de correos con IA.
 
 ## 1. Iniciar MySQL en XAMPP
 
 1. Abre el **XAMPP Control Panel**.
 2. Pulsa **Start** en la fila de **MySQL** (debe quedar en verde, puerto 3306).
-3. La base de datos `assistantutpdb` y sus tablas (`usuarios`, `contactos`, `correos`, `tareas`, `eventos`) se crean solas al abrir la app.
+3. La base de datos `assistantutpdb` y sus tablas (`usuarios`, `contactos`, `correos`, `tareas`, `eventos`) se crean solas al abrir la app (también `ejecuciones` y `pasos_ejecucion`).
    Si lo prefieres, puedes importar `schema.sql` desde phpMyAdmin.
 4. Importar `schema.sql` crea también dos cuentas por defecto (se inicia sesión con el correo):
 
@@ -62,6 +62,19 @@ database = "assistantutpdb"
 streamlit run utp_assistant.py
 ```
 
+## Procesar correo (asistente de IA)
+
+Página **Procesar correo**: pegas el correo de un cliente y el asistente (Groq, modelo `openai/gpt-oss-120b`) propone contactos, tareas y reuniones.
+
+1. El correo se guarda como `pendiente` y se crea una ejecución (`en_cola`).
+2. El modelo analiza el correo (`en_progreso`). Las consultas de solo lectura (`buscar_contacto`, `consultar_disponibilidad`) se ejecutan solas.
+3. Las acciones de escritura (`registrar_contacto_en_crm`, `crear_tarea`, `agendar_reunion`) **no se ejecutan** hasta que las apruebas (`requiere_accion`). Puedes editarlas o rechazarlas.
+4. Con la respuesta final, el correo pasa a `procesado` con su resumen y la ejecución a `completado`.
+
+Reglas: máximo 6 llamadas al modelo por ejecución; reuniones de lunes a viernes entre 09:00 y 18:00 (America/Lima) sin cruces; todo se valida en el servidor. Cada paso queda en `pasos_ejecucion` y se puede ver en **Ver traza de la ejecución**.
+
+> El contenido de los correos se envía a Groq para analizarlo. No pegues información que no deba salir de la empresa.
+
 ## Archivos del proyecto
 
 Todos en la misma carpeta (sin subcarpetas ni paquetes). Se ejecuta con `streamlit run utp_assistant.py`.
@@ -71,7 +84,7 @@ Todos en la misma carpeta (sin subcarpetas ni paquetes). Se ejecuta con `streaml
 | `utp_assistant.py` | Interfaz y navegación: configuración de página, sesión, permisos (`requiere_login`, `requiere_admin`, `obtener_alcance`), cabecera, barra de navegación, todas las pantallas y `main()`. |
 | `db.py` | Conexión a MySQL, `init_db()` con tablas y migraciones, consultas del dashboard, gestión de usuarios y datos de ejemplo. No dibuja interfaz. |
 | `auth.py` | Hash y verificación de contraseñas, validaciones de registro y login, `registrar_usuario()` y `autenticar_usuario()`. No dibuja interfaz. |
-| `assistant.py` | Cliente de Groq (IA) y validación de `GROQ_API_KEY`. En la fase 3 tendrá el prompt de sistema y las llamadas al modelo. |
+| `assistant.py` | Asistente de IA: cliente de Groq, prompt de sistema, herramientas (function calling), validación en servidor y ciclo de ejecución. No dibuja interfaz. |
 | `styles.py` | Todo el CSS y la función que lo inyecta. |
 | `schema.sql` | Esquema completo y cuentas por defecto, para importar desde phpMyAdmin. |
 

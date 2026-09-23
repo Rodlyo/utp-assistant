@@ -107,6 +107,38 @@ CREATE TABLE IF NOT EXISTS eventos (
         REFERENCES contactos(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Ejecuciones del asistente (ciclo de un Run)
+CREATE TABLE IF NOT EXISTS ejecuciones (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    correo_id INT NOT NULL,
+    usuario_id INT NOT NULL,
+    estado ENUM('en_cola','en_progreso','requiere_accion','completado','fallido','cancelado')
+        NOT NULL DEFAULT 'en_cola',
+    iteraciones INT NOT NULL DEFAULT 0,
+    modelo VARCHAR(100) NOT NULL,
+    error TEXT NULL,
+    fecha_inicio DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    fecha_fin DATETIME NULL,
+    CONSTRAINT fk_ejecuciones_correo FOREIGN KEY (correo_id)
+        REFERENCES correos(id) ON DELETE CASCADE,
+    CONSTRAINT fk_ejecuciones_usuario FOREIGN KEY (usuario_id)
+        REFERENCES usuarios(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Pasos de cada ejecución (trazabilidad y auditoría; argumentos y resultado en JSON)
+CREATE TABLE IF NOT EXISTS pasos_ejecucion (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    ejecucion_id INT NOT NULL,
+    tipo ENUM('llamada_modelo','funcion_propuesta','funcion_ejecutada','funcion_rechazada',
+              'error_validacion','respuesta_final') NOT NULL,
+    nombre_funcion VARCHAR(100) NULL,
+    argumentos TEXT NULL,
+    resultado TEXT NULL,
+    fecha DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_pasos_ejecucion FOREIGN KEY (ejecucion_id)
+        REFERENCES ejecuciones(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- Usuarios por defecto: admin / admin123 (administrador) y usuario / usuario123 (usuario).
 -- Se inicia sesión con el correo. Contraseñas guardadas con PBKDF2-HMAC-SHA256
 -- (200 000 iteraciones) y salt aleatorio, igual que las cuentas creadas desde la app.

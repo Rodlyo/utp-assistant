@@ -1,12 +1,17 @@
 # --- Imports y configuración de página ---
 import html
+import json
 import math
+import re
 import time
-from datetime import date
+from datetime import date, datetime
 
 import streamlit as st
 
-from assistant import obtener_cliente_groq
+from assistant import (
+    ESQUEMAS, avanzar_ejecucion, cancelar_ejecucion, iniciar_ejecucion, obtener_cliente_groq,
+    reanudar_tras_confirmacion, reintentar_ejecucion, validar_correo_entrante, validar_decisiones,
+)
 from auth import (
     autenticar_usuario, registrar_acceso, registrar_usuario, validar_login, validar_registro,
 )
@@ -14,7 +19,7 @@ from db import (
     ErrorBaseDatos, cambiar_estado_usuario, cambiar_rol_usuario, cargar_datos_ejemplo,
     contar_contactos, contar_correos_procesados, contar_reuniones_proximas,
     contar_tareas_pendientes, init_db, listar_usuarios, listar_usuarios_activos,
-    obtener_actividad_reciente, obtener_estado_usuario, obtener_proximas_reuniones,
+    obtener_actividad_reciente, obtener_estado_usuario, obtener_pasos, obtener_proximas_reuniones,
     obtener_tareas_pendientes, tiene_datos,
 )
 from styles import aplicar_estilos
@@ -81,7 +86,8 @@ PAGINAS_VALIDAS = PAGINAS_PUBLICAS + PAGINAS_INTERNAS
 # Claves de sesión que se borran al cerrar sesión.
 CLAVES_USUARIO = (
     "usuario_id", "usuario_nombre", "usuario_correo", "usuario_rol",
-    "alcance_admin", "accion_pendiente", "usuario_gestion",
+    "alcance_admin", "accion_pendiente", "usuario_gestion", "ejecucion",
+    "pc_nombre", "pc_correo", "pc_asunto", "pc_cuerpo",
 )
 
 
@@ -217,7 +223,7 @@ def render_pie():
         "</div>"
         '<div><div class="utp-pie-titulo">Módulos</div><div class="utp-pie-lista">'
         '<div>Dashboard <span class="utp-pie-activo">· Activo</span></div>'
-        "<div>Procesar correo <span>· Fase 3</span></div>"
+        '<div>Procesar correo <span class="utp-pie-activo">· Activo</span></div>'
         "<div>Calendario <span>· Fase 4</span></div>"
         "<div>Correos <span>· Fase 5</span></div>"
         "</div></div>"
@@ -766,6 +772,309 @@ def render_usuarios():
     render_pie()
 
 
+# --- Procesar correo ---
+CORREO_EJEMPLO = {
+    "pc_nombre": "Ana Torres",
+    "pc_correo": "ana.torres@techcorp.com",
+    "pc_asunto": "Avance con la propuesta",
+    "pc_cuerpo": (
+        "Hola equipo de UTP Consult, gracias por la propuesta. Nos interesa avanzar. "
+        "¿Podríamos tener una reunión la próxima semana para discutir los detalles técnicos "
+        "del módulo de pagos? Adjunto un documento con algunos requisitos iniciales. "
+        "Saludos, Ana Torres de TechCorp."
+    ),
+}
+ESTADOS_RUN = [("en_cola", "En cola"), ("en_progreso", "En progreso"),
+               ("requiere_accion", "Requiere acción"), ("completado", "Completado")]
+# Estados finales sin éxito: (etiqueta, pasos previos marcados como hechos).
+ESTADOS_FINALES = {"fallido": ("Fallido", 2), "cancelado": ("Cancelado", 3)}
+TITULOS_ACCION = {"registrar_contacto_en_crm": "Registrar contacto", "crear_tarea": "Crear tarea",
+                  "agendar_reunion": "Agendar reunión"}
+TIPOS_PASO = {"llamada_modelo": "Llamada al modelo", "funcion_propuesta": "Función propuesta",
+              "funcion_ejecutada": "Función ejecutada", "funcion_rechazada": "Función rechazada",
+              "error_validacion": "Error de validación", "respuesta_final": "Respuesta final"}
+SECCIONES_RESUMEN = re.compile(
+    r"^(CLIENTE|SOLICITUD|ACCIONES REALIZADAS|PENDIENTES|SIGUIENTE PASO SUGERIDO)\s*:\s*(.*)$", re.I
+)
+
+
+# Rellena el formulario con el correo de ejemplo (callback).
+def _cargar_correo_ejemplo():
+    st.session_state.update(CORREO_EJEMPLO)
+
+
+# Limpia la ejecución y el formulario (callback).
+def _limpiar_procesamiento():
+    for clave in ("ejecucion", *CORREO_EJEMPLO):
+        st.session_state.pop(clave, None)
+
+
+# Indicador EN COLA → EN PROGRESO → REQUIERE ACCIÓN → COMPLETADO.
+def _html_estado_run(estado):
+    claves = [c for c, _ in ESTADOS_RUN]
+    if estado in ESTADOS_FINALES:
+        etiqueta_final, hechos = ESTADOS_FINALES[estado]
+        pasos = [(e, "hecho" if i < hechos else "") for i, (_, e) in enumerate(ESTADOS_RUN[:hechos])]
+        pasos.append((etiqueta_final, "actual"))
+    else:
+        actual = claves.index(estado)
+        pasos = [(e, "actual" if i == actual else "hecho" if i < actual else "")
+                 for i, (_, e) in enumerate(ESTADOS_RUN)]
+    flecha = '<span class="utp-run-flecha">→</span>'
+    return '<div class="utp-run">' + flecha.join(
+        f'<span class="{clase}">{etiqueta}</span>' for etiqueta, clase in pasos) + "</div>"
+
+
+# Llama al modelo mostrando el estado y un spinner; guarda el resultado en la sesión.
+def _avanzar_con_spinner(run, funcion, *args):
+    st.markdown(_html_estado_run("en_progreso"), unsafe_allow_html=True)
+    with st.spinner("El asistente está analizando el correo…"):
+        run = funcion(obtener_cliente_groq(), run, *args)
+    st.session_state["ejecucion"] = run
+    st.rerun()
+
+
+def _render_formulario_correo():
+    st.button("Cargar correo de ejemplo", key="pc_ejemplo", on_click=_cargar_correo_ejemplo)
+    with st.form("form_correo"):
+        st.markdown(
+            '<div class="utp-form-titulo">Correo del cliente</div>'
+            '<div class="utp-form-subtitulo">Pega el correo tal como lo recibiste.</div>',
+            unsafe_allow_html=True,
+        )
+        col_nombre, col_correo = st.columns(2)
+        nombre = col_nombre.text_input("Nombre del remitente", key="pc_nombre", max_chars=100)
+        correo = col_correo.text_input("Correo del remitente", key="pc_correo", max_chars=150)
+        asunto = st.text_input("Asunto", key="pc_asunto", max_chars=255)
+        cuerpo = st.text_area("Cuerpo del correo", key="pc_cuerpo", height=260, max_chars=10_000)
+        enviado = st.form_submit_button("Analizar correo", type="primary", width="stretch")
+    if enviado:
+        errores = validar_correo_entrante(nombre, correo, asunto, cuerpo)
+        if errores:
+            st.error("Revisa los siguientes datos:\n\n" + "\n".join(f"- {e}" for e in errores))
+            return
+        run = iniciar_ejecucion(st.session_state["usuario_id"], nombre.strip(),
+                                correo.strip().lower(), asunto.strip(), cuerpo.strip())
+        st.session_state["ejecucion"] = run
+        st.markdown(_html_estado_run("en_cola"), unsafe_allow_html=True)
+        _avanzar_con_spinner(run, avanzar_ejecucion)
+
+
+# Quita espacios y omite los opcionales vacíos.
+def _limpiar_argumentos(nombre, argumentos):
+    requeridos = ESQUEMAS[nombre]["required"]
+    limpios = {}
+    for clave, valor in argumentos.items():
+        valor = valor.strip() if isinstance(valor, str) else valor
+        if valor in ("", None) and clave not in requeridos:
+            continue
+        limpios[clave] = valor
+    return limpios
+
+
+# Campos editables de una acción propuesta; devuelve los argumentos editados.
+def _campos_accion(p):
+    k, a, nombre = p["id"], p["argumentos"], p["nombre"]
+    if nombre == "registrar_contacto_en_crm":
+        c1, c2 = st.columns(2)
+        datos = {
+            "nombre": c1.text_input("Nombre", a.get("nombre", ""), key=f"{k}_nombre"),
+            "correo": c2.text_input("Correo", a.get("correo", ""), key=f"{k}_correo"),
+            "empresa": c1.text_input("Empresa", a.get("empresa", ""), key=f"{k}_empresa"),
+            "cargo": c2.text_input("Cargo", a.get("cargo", ""), key=f"{k}_cargo"),
+            "telefono": c1.text_input("Teléfono", a.get("telefono", ""), key=f"{k}_telefono"),
+        }
+        estados = ["", "prospecto", "cliente", "inactivo"]
+        datos["estado"] = c2.selectbox(
+            "Estado", estados, index=estados.index(a.get("estado") or ""), key=f"{k}_estado",
+            format_func=lambda v: v.capitalize() if v else "Sin indicar",
+        )
+        datos["notas"] = st.text_area("Notas", a.get("notas", ""), key=f"{k}_notas", height=90)
+    elif nombre == "crear_tarea":
+        prioridades = ["baja", "media", "alta", "urgente"]
+        limite = a.get("fecha_limite")
+        c1, c2 = st.columns(2)
+        datos = {
+            "titulo": st.text_input("Título", a.get("titulo", ""), key=f"{k}_titulo", max_chars=200),
+            "descripcion": st.text_area("Descripción", a.get("descripcion", ""), key=f"{k}_desc", height=90),
+            "prioridad": c1.selectbox("Prioridad", prioridades, index=prioridades.index(a["prioridad"]),
+                                      key=f"{k}_prioridad", format_func=str.capitalize),
+        }
+        fecha = c2.date_input("Fecha límite", datetime.strptime(limite, "%Y-%m-%d").date() if limite else None,
+                              key=f"{k}_limite", format="YYYY-MM-DD")
+        datos["fecha_limite"] = f"{fecha:%Y-%m-%d}" if fecha else ""
+        datos["correo_contacto"] = st.text_input("Correo del contacto", a.get("correo_contacto", ""),
+                                                 key=f"{k}_contacto")
+    else:
+        inicio = datetime.strptime(a["fecha_inicio"], "%Y-%m-%dT%H:%M")
+        datos = {
+            "titulo": st.text_input("Título", a.get("titulo", ""), key=f"{k}_titulo", max_chars=200),
+            "descripcion": st.text_area("Temas a tratar", a.get("descripcion", ""), key=f"{k}_desc", height=90),
+        }
+        c1, c2, c3 = st.columns(3)
+        fecha = c1.date_input("Fecha", inicio.date(), key=f"{k}_fecha", format="YYYY-MM-DD")
+        hora = c2.time_input("Hora", inicio.time(), key=f"{k}_hora", step=900)
+        datos["duracion_minutos"] = int(c3.number_input(
+            "Duración (min)", 15, 240, int(a["duracion_minutos"]), 15, key=f"{k}_duracion"))
+        datos["fecha_inicio"] = f"{fecha:%Y-%m-%d}T{hora:%H:%M}" if fecha and hora else ""
+        modalidades = ["virtual", "presencial"]
+        datos["modalidad"] = c1.selectbox("Modalidad", modalidades, index=modalidades.index(a["modalidad"]),
+                                          key=f"{k}_modalidad", format_func=str.capitalize)
+        datos["correo_contacto"] = st.text_input("Correo del contacto", a.get("correo_contacto", ""),
+                                                 key=f"{k}_contacto")
+        datos["fecha_confirmada_por_cliente"] = a["fecha_confirmada_por_cliente"]
+    return _limpiar_argumentos(nombre, datos)
+
+
+def _render_acciones_propuestas(run):
+    with st.form("form_acciones"):
+        st.markdown(
+            '<div class="utp-form-titulo">Acciones propuestas</div>'
+            '<div class="utp-form-subtitulo">Revisa, corrige si hace falta y aprueba o rechaza cada acción.</div>',
+            unsafe_allow_html=True,
+        )
+        decisiones = {}
+        for i, p in enumerate(run["pendientes"]):
+            with st.container(key=f"accion_{i}"):
+                st.markdown(f'<div class="utp-accion-tipo">{TITULOS_ACCION[p["nombre"]]}</div>',
+                            unsafe_allow_html=True)
+                if p["nombre"] == "agendar_reunion" and not p["argumentos"]["fecha_confirmada_por_cliente"]:
+                    st.warning("Horario propuesto por el asistente, pendiente de confirmar con el cliente.")
+                argumentos = _campos_accion(p)
+                decision = st.radio("Decisión", ["Aprobar", "Rechazar"], horizontal=True,
+                                    key=f"{p['id']}_decision")
+                decisiones[p["id"]] = {"aprobado": decision == "Aprobar", "argumentos": argumentos}
+        col_si, col_no = st.columns(2)
+        confirmar = col_si.form_submit_button("Confirmar acciones", type="primary", width="stretch")
+        cancelar = col_no.form_submit_button("Cancelar procesamiento", width="stretch")
+
+    if cancelar:
+        st.session_state["ejecucion"] = cancelar_ejecucion(run)
+        st.rerun()
+    if confirmar:
+        errores = validar_decisiones(run, decisiones)
+        if errores:
+            for p in run["pendientes"]:
+                if p["id"] in errores:
+                    st.error(f"Revisa «{TITULOS_ACCION[p['nombre']]}»: " + " ".join(errores[p["id"]]))
+            return
+        _avanzar_con_spinner(run, reanudar_tras_confirmacion, decisiones)
+
+
+# Resumen del modelo con los títulos de sección destacados.
+def _html_resumen(texto):
+    bloques = []
+    for linea in texto.splitlines():
+        linea = linea.strip().replace("**", "")
+        if not linea:
+            continue
+        seccion = SECCIONES_RESUMEN.match(linea)
+        if seccion:
+            bloques.append(f'<div class="utp-resumen-titulo">{seccion.group(1).upper()}</div>')
+            linea = seccion.group(2)
+        if linea:
+            bloques.append(f"<p>{html.escape(linea)}</p>")
+    return ('<div class="utp-tarjeta utp-tarjeta-ancha utp-resumen">'
+            '<div class="utp-tarjeta-titulo">Resumen del asistente</div>' + "".join(bloques) + "</div>")
+
+
+# Lista de lo creado (contacto, tareas y reunión).
+def _html_creados(creados):
+    filas = []
+    for c in creados:
+        a, r = c["argumentos"], c["resultado"]
+        if c["nombre"] == "registrar_contacto_en_crm":
+            detalle = " · ".join(html.escape(v) for v in (a.get("empresa"), a.get("correo")) if v)
+            etiqueta = f'Contacto {"creado" if r.get("accion") == "creado" else "actualizado"}'
+            titulo, meta = a["nombre"], f"<span>{detalle}</span>"
+        elif c["nombre"] == "crear_tarea":
+            vence = f'Vence {formato_fecha_corta(datetime.strptime(a["fecha_limite"], "%Y-%m-%d"))}' \
+                if a.get("fecha_limite") else "Sin fecha límite"
+            etiqueta, titulo = "Tarea", a["titulo"]
+            meta = (f'<span class="utp-prioridad utp-prioridad-{a["prioridad"]}">{a["prioridad"]}</span>'
+                    f"<span>{vence}</span>")
+        else:
+            inicio = datetime.strptime(a["fecha_inicio"], "%Y-%m-%dT%H:%M")
+            etiqueta, titulo = "Reunión", a["titulo"]
+            meta = (f"<span>{formato_fecha_hora(inicio)} · {a['duracion_minutos']} min</span>"
+                    f'<span class="utp-chip">{a["modalidad"]}</span>')
+        filas.append(
+            f'<div class="utp-item"><div class="utp-item-fecha">{etiqueta}</div>'
+            f'<div class="utp-item-titulo">{html.escape(titulo)}</div>'
+            f'<div class="utp-item-meta">{meta}</div></div>'
+        )
+    contenido = "".join(filas) or _html_vacio("No se creó ningún registro.")
+    return ('<div class="utp-tarjeta utp-tarjeta-ancha">'
+            f'<div class="utp-tarjeta-titulo">Registros creados</div>{contenido}</div>')
+
+
+# JSON guardado en la traza, con sangría legible.
+def _json_legible(texto):
+    try:
+        return json.dumps(json.loads(texto), ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        return str(texto)
+
+
+def _render_traza(run):
+    with st.expander("Ver traza de la ejecución"):
+        for i, paso in enumerate(obtener_pasos(run["ejecucion_id"], st.session_state["usuario_id"]), 1):
+            funcion = f' · {paso["nombre_funcion"]}' if paso["nombre_funcion"] else ""
+            st.markdown(
+                f'<div class="utp-traza-paso">{i:02d} · {TIPOS_PASO[paso["tipo"]]}{funcion}'
+                f'<span>{paso["fecha"]:%H:%M:%S}</span></div>',
+                unsafe_allow_html=True,
+            )
+            for etiqueta in ("argumentos", "resultado"):
+                if paso[etiqueta]:
+                    st.caption(etiqueta.capitalize())
+                    st.code(_json_legible(paso[etiqueta]), language="json")
+
+
+def _render_completado(run):
+    st.markdown(_html_resumen(run["resumen"]) + _html_creados(run["creados"]), unsafe_allow_html=True)
+    _render_traza(run)
+    st.button("Procesar otro correo", key="pc_otro", type="primary", on_click=_limpiar_procesamiento)
+
+
+def _render_fallido(run):
+    st.error(run["error"])
+    col_reintentar, col_otro = st.columns(2)
+    if col_reintentar.button("Reintentar", key="pc_reintentar", type="primary", width="stretch"):
+        _avanzar_con_spinner(reintentar_ejecucion(run), avanzar_ejecucion)
+    col_otro.button("Procesar otro correo", key="pc_otro", width="stretch", on_click=_limpiar_procesamiento)
+
+
+def _render_cancelado(run):
+    st.info("Procesamiento cancelado. El correo quedó guardado como pendiente.")
+    st.button("Procesar otro correo", key="pc_otro", type="primary", on_click=_limpiar_procesamiento)
+
+
+def render_procesar():
+    render_cabecera(meta="UTPConsult · Sistema interno")
+    render_navegacion_interna("procesar")
+    with st.container(key="contenido"):
+        st.markdown(
+            '<div class="utp-eyebrow">Asistente de IA</div>'
+            '<div class="utp-titulo">Procesar correo</div>'
+            '<p class="utp-subtitulo">El asistente lee el correo y propone contactos, tareas y '
+            "reuniones para que los apruebes.</p>",
+            unsafe_allow_html=True,
+        )
+        run = st.session_state.get("ejecucion")
+        if run is None:
+            _render_formulario_correo()
+        else:
+            st.markdown(_html_estado_run(run["estado"]), unsafe_allow_html=True)
+            pantallas = {"requiere_accion": _render_acciones_propuestas, "completado": _render_completado,
+                         "fallido": _render_fallido, "cancelado": _render_cancelado}
+            if run["estado"] in pantallas:
+                pantallas[run["estado"]](run)
+            else:
+                st.button("Procesar otro correo", key="pc_otro", on_click=_limpiar_procesamiento)
+    render_pie()
+
+
 # Página de marcador para módulos pendientes.
 def render_modulo_pendiente(pagina, titulo, fase, descripcion):
     render_cabecera(meta="UTPConsult · Sistema interno")
@@ -783,8 +1092,6 @@ def render_modulo_pendiente(pagina, titulo, fase, descripcion):
 
 # Módulos pendientes: página → (título, número, descripción).
 MODULOS_PENDIENTES = {
-    "procesar": ("Procesar correo", 3,
-                 "Pega el correo de un cliente y la IA creará tareas, reuniones y contactos."),
     "calendario": ("Calendario", 4,
                    "Consulta y gestiona las reuniones agendadas a partir de los correos."),
     "correos": ("Correos", 5,
@@ -811,6 +1118,7 @@ def main():
             "registro": render_registro,
             "login": render_login,
             "dashboard": render_dashboard,
+            "procesar": render_procesar,
             "usuarios": render_usuarios,
         }
         if pagina in MODULOS_PENDIENTES:

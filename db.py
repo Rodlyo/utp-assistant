@@ -1,4 +1,5 @@
 # Base de datos MySQL (XAMPP): conexión, tablas, migraciones y consultas.
+import json
 import re
 from datetime import datetime, timedelta
 
@@ -156,6 +157,38 @@ TABLAS_SQL = [
             REFERENCES correos(id) ON DELETE SET NULL,
         CONSTRAINT fk_eventos_contacto FOREIGN KEY (contacto_id)
             REFERENCES contactos(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ejecuciones (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        correo_id INT NOT NULL,
+        usuario_id INT NOT NULL,
+        estado ENUM('en_cola','en_progreso','requiere_accion','completado','fallido','cancelado')
+            NOT NULL DEFAULT 'en_cola',
+        iteraciones INT NOT NULL DEFAULT 0,
+        modelo VARCHAR(100) NOT NULL,
+        error TEXT NULL,
+        fecha_inicio DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        fecha_fin DATETIME NULL,
+        CONSTRAINT fk_ejecuciones_correo FOREIGN KEY (correo_id)
+            REFERENCES correos(id) ON DELETE CASCADE,
+        CONSTRAINT fk_ejecuciones_usuario FOREIGN KEY (usuario_id)
+            REFERENCES usuarios(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS pasos_ejecucion (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        ejecucion_id INT NOT NULL,
+        tipo ENUM('llamada_modelo','funcion_propuesta','funcion_ejecutada','funcion_rechazada',
+                  'error_validacion','respuesta_final') NOT NULL,
+        nombre_funcion VARCHAR(100) NULL,
+        argumentos TEXT NULL,
+        resultado TEXT NULL,
+        fecha DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT fk_pasos_ejecucion FOREIGN KEY (ejecucion_id)
+            REFERENCES ejecuciones(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
 ]
@@ -575,3 +608,173 @@ def cargar_datos_ejemplo(usuario_id):
         raise
     finally:
         conexion.close()
+
+
+# --- Procesamiento de correos (asistente) ---
+# INSERT/UPDATE parametrizado; devuelve el id insertado.
+def _ejecutar(sql, parametros):
+    conexion = get_connection()
+    try:
+        with conexion.cursor() as cursor:
+            cursor.execute(sql, parametros)
+            nuevo_id = cursor.lastrowid
+        conexion.commit()
+        return nuevo_id
+    finally:
+        conexion.close()
+
+
+# Texto JSON legible para guardar en la traza.
+def _a_json(valor):
+    if valor is None or isinstance(valor, str):
+        return valor
+    return json.dumps(valor, ensure_ascii=False, default=str)
+
+
+# Guarda el correo recibido (estado 'pendiente').
+def guardar_correo(usuario_id, remitente_nombre, remitente_correo, asunto, cuerpo):
+    return _ejecutar(
+        "INSERT INTO correos (usuario_id, remitente_nombre, remitente_correo, asunto, cuerpo) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (usuario_id, remitente_nombre or None, remitente_correo or None, asunto or None, cuerpo),
+    )
+
+
+# Correo del usuario (None si no existe o es de otro usuario).
+def obtener_correo(correo_id, usuario_id):
+    return _consultar(
+        "SELECT id, remitente_nombre, remitente_correo, asunto, cuerpo, resumen, estado, contacto_id "
+        "FROM correos WHERE id = %s AND usuario_id = %s",
+        (correo_id, usuario_id),
+        uno=True,
+    )
+
+
+# Actualiza estado, resumen y/o contacto del correo; 'procesado' fija fecha_procesado.
+def actualizar_correo(correo_id, usuario_id, estado=None, resumen=None, contacto_id=None):
+    campos, valores = [], []
+    if estado is not None:
+        campos.append("estado = %s")
+        valores.append(estado)
+        if estado == "procesado":
+            campos.append("fecha_procesado = NOW()")
+    if resumen is not None:
+        campos.append("resumen = %s")
+        valores.append(resumen)
+    if contacto_id is not None:
+        campos.append("contacto_id = %s")
+        valores.append(contacto_id)
+    if campos:
+        _ejecutar(
+            f"UPDATE correos SET {', '.join(campos)} WHERE id = %s AND usuario_id = %s",
+            tuple(valores) + (correo_id, usuario_id),
+        )
+
+
+# Contacto del usuario por correo (None si no existe).
+def buscar_contacto_por_correo(usuario_id, correo):
+    return _consultar(
+        "SELECT id, nombre, empresa, correo, telefono, cargo, estado, notas "
+        "FROM contactos WHERE usuario_id = %s AND correo = %s ORDER BY id LIMIT 1",
+        (usuario_id, correo),
+        uno=True,
+    )
+
+
+# Crea o actualiza el contacto (por correo y usuario) sin pisar datos con vacíos.
+def upsert_contacto(usuario_id, datos):
+    campos = ("nombre", "empresa", "cargo", "telefono", "estado")
+    nuevos = {c: (datos.get(c) or "").strip() for c in campos}
+    notas = (datos.get("notas") or "").strip()
+    existente = buscar_contacto_por_correo(usuario_id, datos["correo"])
+    if existente is None:
+        contacto_id = _ejecutar(
+            "INSERT INTO contactos "
+            "(usuario_id, nombre, empresa, correo, telefono, cargo, estado, notas) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (usuario_id, nuevos["nombre"], nuevos["empresa"] or None, datos["correo"],
+             nuevos["telefono"] or None, nuevos["cargo"] or None,
+             nuevos["estado"] or "prospecto", notas or None),
+        )
+        return contacto_id, True
+    # Solo se actualizan los campos con valor; las notas nuevas se añaden a las existentes.
+    cambios = {c: v for c, v in nuevos.items() if v}
+    if notas and notas not in (existente["notas"] or ""):
+        cambios["notas"] = f"{existente['notas']}\n{notas}" if existente["notas"] else notas
+    if cambios:
+        _ejecutar(
+            f"UPDATE contactos SET {', '.join(f'{c} = %s' for c in cambios)} "
+            "WHERE id = %s AND usuario_id = %s",
+            tuple(cambios.values()) + (existente["id"], usuario_id),
+        )
+    return existente["id"], False
+
+
+# Inserta una tarea del usuario.
+def crear_tarea(usuario_id, correo_id, contacto_id, titulo, descripcion, prioridad, fecha_limite):
+    return _ejecutar(
+        "INSERT INTO tareas (usuario_id, correo_id, contacto_id, titulo, descripcion, "
+        "prioridad, fecha_limite) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (usuario_id, correo_id, contacto_id, titulo, descripcion, prioridad, fecha_limite),
+    )
+
+
+# Inserta una reunión programada del usuario.
+def crear_evento(usuario_id, correo_id, contacto_id, titulo, descripcion, inicio, fin, modalidad):
+    return _ejecutar(
+        "INSERT INTO eventos (usuario_id, correo_id, contacto_id, titulo, descripcion, "
+        "fecha_inicio, fecha_fin, modalidad) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (usuario_id, correo_id, contacto_id, titulo, descripcion, inicio, fin, modalidad),
+    )
+
+
+# Reuniones programadas del usuario que se cruzan con [desde, hasta).
+def eventos_en_rango(usuario_id, desde, hasta):
+    return _consultar(
+        "SELECT id, titulo, fecha_inicio, fecha_fin, modalidad FROM eventos "
+        "WHERE usuario_id = %s AND estado = 'programada' "
+        "AND fecha_inicio < %s AND fecha_fin > %s "
+        "ORDER BY fecha_inicio",
+        (usuario_id, hasta, desde),
+    )
+
+
+# Crea la ejecución (estado 'en_cola').
+def crear_ejecucion(usuario_id, correo_id, modelo):
+    return _ejecutar(
+        "INSERT INTO ejecuciones (usuario_id, correo_id, modelo) VALUES (%s, %s, %s)",
+        (usuario_id, correo_id, modelo),
+    )
+
+
+# Actualiza estado, iteraciones y/o error; finalizar=True fija fecha_fin.
+def actualizar_ejecucion(ejecucion_id, estado=None, iteraciones=None, error=None, finalizar=False):
+    campos, valores = [], []
+    for columna, valor in (("estado", estado), ("iteraciones", iteraciones), ("error", error)):
+        if valor is not None:
+            campos.append(f"{columna} = %s")
+            valores.append(valor)
+    if finalizar:
+        campos.append("fecha_fin = NOW()")
+    if campos:
+        _ejecutar(f"UPDATE ejecuciones SET {', '.join(campos)} WHERE id = %s",
+                  tuple(valores) + (ejecucion_id,))
+
+
+# Registra un paso de la ejecución (argumentos y resultado en JSON).
+def registrar_paso(ejecucion_id, tipo, nombre_funcion=None, argumentos=None, resultado=None):
+    _ejecutar(
+        "INSERT INTO pasos_ejecucion (ejecucion_id, tipo, nombre_funcion, argumentos, resultado) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (ejecucion_id, tipo, nombre_funcion, _a_json(argumentos), _a_json(resultado)),
+    )
+
+
+# Pasos de una ejecución del usuario, en orden.
+def obtener_pasos(ejecucion_id, usuario_id):
+    return _consultar(
+        "SELECT p.id, p.tipo, p.nombre_funcion, p.argumentos, p.resultado, p.fecha "
+        "FROM pasos_ejecucion p JOIN ejecuciones e ON e.id = p.ejecucion_id "
+        "WHERE p.ejecucion_id = %s AND e.usuario_id = %s ORDER BY p.id",
+        (ejecucion_id, usuario_id),
+    )
