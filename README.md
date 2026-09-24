@@ -1,6 +1,6 @@
 # UTP Assistant
 
-Sistema interno de UTPConsult. Incluye landing page, registro, login, dashboard con métricas, gestión de usuarios y procesamiento de correos con IA.
+Sistema interno de UTPConsult. Incluye landing page, registro, login, dashboard con métricas, gestión de usuarios, procesamiento de correos con IA, calendario de reuniones e historial de correos.
 
 ## 1. Iniciar MySQL en XAMPP
 
@@ -74,6 +74,36 @@ Página **Procesar correo**: pegas el correo de un cliente y el asistente (Groq,
 Reglas: máximo 6 llamadas al modelo por ejecución; reuniones de lunes a viernes entre 09:00 y 18:00 (America/Lima) sin cruces; todo se valida en el servidor. Cada paso queda en `pasos_ejecucion` y se puede ver en **Ver traza de la ejecución**.
 
 > El contenido de los correos se envía a Groq para analizarlo. No pegues información que no deba salir de la empresa.
+
+## Calendario
+
+Página **Calendario** con tres vistas (**Mes**, **Semana** y **Agenda** de 30 días), navegación Anterior / Hoy / Siguiente y un **detalle del día** con las reuniones en tarjetas.
+
+- Estados: confirmada (negro), **por confirmar** con el cliente (borde discontinuo, propuesta por el asistente), realizada (gris) y cancelada (tachada).
+- Acciones: nueva reunión, editar, confirmar con cliente, marcar como realizada (si ya empezó) y cancelar (con confirmación).
+- Mismas reglas que el asistente: lunes a viernes, de 09:00 a 18:00 (America/Lima), en el futuro y sin cruces con otra reunión programada.
+- Cada usuario gestiona sus reuniones; el administrador ve **"Ver calendario de:"** y puede gestionar las de todo el equipo. Los permisos se validan en la base de datos.
+
+## Correos (historial)
+
+Página **Correos** con todo lo que llegó de los clientes:
+
+- Métricas (total, procesados, pendientes, con error) que respetan los filtros.
+- Filtros: búsqueda de texto (asunto, cuerpo, remitente y su correo; `%` y `_` se buscan como texto; no distingue tildes), estado y rango de fechas. El administrador elige **"Ver correos de:"**. **Limpiar filtros** y **Exportar CSV** (los correos filtrados, en UTF-8 para Excel).
+- Listado de 10 correos por página con fecha, remitente, asunto, estado, tareas y reuniones generadas.
+- **Ver detalle**: correo original (siempre como texto plano), resumen del asistente, contacto, tareas (con cambio de estado), reuniones (con **Ver en calendario**) y la traza de cada ejecución.
+- **Reprocesar** (correos pendientes o con error; avisa si puede duplicar acciones) y **Eliminar correo**: las tareas, reuniones y contactos se conservan; sus ejecuciones y la traza se borran.
+
+## Módulos del sistema
+
+| Módulo | Qué hace | Quién lo usa |
+|---|---|---|
+| Landing, registro y login | Página pública, alta de cuentas (el primer usuario es administrador) y acceso con bloqueo tras 5 intentos | Todos |
+| Dashboard | Métricas, próximas reuniones, tareas pendientes y actividad reciente | Usuarios y administradores (equipo completo o por persona) |
+| Procesar correo | El asistente de IA (Groq) propone contactos, tareas y reuniones; el usuario aprueba, edita o rechaza | Usuarios y administradores |
+| Calendario | Vistas mes, semana y agenda; crear, editar, confirmar, marcar como realizada y cancelar reuniones | Usuarios (las suyas) y administradores (todas) |
+| Correos | Historial con filtros, detalle, traza, reprocesar, eliminar y exportar CSV | Usuarios (los suyos) y administradores (todos) |
+| Usuarios | Roles, activar/desactivar cuentas, siempre con al menos un administrador activo | Solo administradores |
 
 ## Archivos del proyecto
 

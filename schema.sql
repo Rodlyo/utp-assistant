@@ -60,11 +60,15 @@ CREATE TABLE IF NOT EXISTS correos (
     estado ENUM('pendiente','procesado','error') NOT NULL DEFAULT 'pendiente',
     fecha_recepcion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     fecha_procesado DATETIME NULL,
+    INDEX idx_correos_usuario_fecha (usuario_id, fecha_recepcion),
     CONSTRAINT fk_correos_usuario FOREIGN KEY (usuario_id)
         REFERENCES usuarios(id) ON DELETE CASCADE,
     CONSTRAINT fk_correos_contacto FOREIGN KEY (contacto_id)
         REFERENCES contactos(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Migración: índice del historial de correos (MariaDB admite IF NOT EXISTS).
+CREATE INDEX IF NOT EXISTS idx_correos_usuario_fecha ON correos (usuario_id, fecha_recepcion);
 
 -- Gestor de tareas interno
 CREATE TABLE IF NOT EXISTS tareas (
@@ -98,6 +102,7 @@ CREATE TABLE IF NOT EXISTS eventos (
     fecha_fin DATETIME NOT NULL,
     modalidad ENUM('virtual','presencial') NOT NULL DEFAULT 'virtual',
     estado ENUM('programada','realizada','cancelada') NOT NULL DEFAULT 'programada',
+    confirmada_por_cliente TINYINT(1) NOT NULL DEFAULT 1,
     fecha_creacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_eventos_usuario FOREIGN KEY (usuario_id)
         REFERENCES usuarios(id) ON DELETE CASCADE,
@@ -106,6 +111,9 @@ CREATE TABLE IF NOT EXISTS eventos (
     CONSTRAINT fk_eventos_contacto FOREIGN KEY (contacto_id)
         REFERENCES contactos(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Migración: confirmación del cliente en reuniones creadas antes de esta columna.
+ALTER TABLE eventos ADD COLUMN IF NOT EXISTS confirmada_por_cliente TINYINT(1) NOT NULL DEFAULT 1;
 
 -- Ejecuciones del asistente (ciclo de un Run)
 CREATE TABLE IF NOT EXISTS ejecuciones (
@@ -125,7 +133,7 @@ CREATE TABLE IF NOT EXISTS ejecuciones (
         REFERENCES usuarios(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Pasos de cada ejecución (trazabilidad y auditoría; argumentos y resultado en JSON)
+-- Pasos de cada ejecución (trazabilidad y auditoría, con argumentos y resultado en JSON)
 CREATE TABLE IF NOT EXISTS pasos_ejecucion (
     id INT AUTO_INCREMENT PRIMARY KEY,
     ejecucion_id INT NOT NULL,

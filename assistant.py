@@ -272,7 +272,7 @@ def _validar_esquema(esquema, argumentos):
 
 
 # Reglas propias de cada función (fechas, horarios, correos, cruces).
-def _validar_reglas(nombre, a, usuario_id):
+def _validar_reglas(nombre, a, usuario_id, excluir_evento_id=None):
     errores, ahora = [], ahora_lima()
     for clave in ("correo", "correo_contacto"):
         if a.get(clave) and not _correo_valido(a[clave]):
@@ -309,7 +309,7 @@ def _validar_reglas(nombre, a, usuario_id):
         if inicio.hour < HORA_APERTURA or fin > cierre:
             errores.append("La reunión debe empezar y terminar entre 09:00 y 18:00 (America/Lima).")
         if not errores and usuario_id is not None:
-            for evento in db.eventos_en_rango(usuario_id, inicio, fin):
+            for evento in db.existe_cruce(usuario_id, inicio, fin, excluir_evento_id):
                 errores.append(
                     f"Se cruza con la reunión '{evento['titulo']}' "
                     f"({evento['fecha_inicio']:%Y-%m-%d %H:%M}-{evento['fecha_fin']:%H:%M})."
@@ -317,14 +317,14 @@ def _validar_reglas(nombre, a, usuario_id):
     return errores
 
 
-# Lista de errores de los argumentos (vacía si son válidos).
-def validar_argumentos(nombre, argumentos, usuario_id=None):
+# Lista de errores (vacía si son válidos); excluir_evento_id ignora esa reunión en el cruce.
+def validar_argumentos(nombre, argumentos, usuario_id=None, excluir_evento_id=None):
     if nombre not in ESQUEMAS:
         return [f"La función {nombre} no existe."]
     if not isinstance(argumentos, dict):
         return ["Los argumentos deben ser un objeto JSON."]
     errores = _validar_esquema(ESQUEMAS[nombre], argumentos)
-    return errores or _validar_reglas(nombre, argumentos, usuario_id)
+    return errores or _validar_reglas(nombre, argumentos, usuario_id, excluir_evento_id)
 
 
 # --- Ejecución de funciones (usuario_id y correo_id los pone el servidor) ---
@@ -381,6 +381,7 @@ def ejecutar_funcion(nombre, argumentos, usuario_id, correo_id):
         evento_id = db.crear_evento(
             usuario_id, correo_id, _contacto_id(usuario_id, a.get("correo_contacto")),
             _texto(a, "titulo"), _texto(a, "descripcion"), inicio, fin, a["modalidad"],
+            confirmada=a["fecha_confirmada_por_cliente"],
         )
         return {"estado": "ok", "evento_id": evento_id,
                 "inicio": f"{inicio:%Y-%m-%dT%H:%M}", "fin": f"{fin:%Y-%m-%dT%H:%M}"}

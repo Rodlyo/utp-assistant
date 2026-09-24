@@ -1,26 +1,32 @@
 # --- Imports y configuración de página ---
+import csv
 import html
+import io
 import json
 import math
 import re
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from datetime import time as dtime
 
 import streamlit as st
 
 from assistant import (
-    ESQUEMAS, avanzar_ejecucion, cancelar_ejecucion, iniciar_ejecucion, obtener_cliente_groq,
-    reanudar_tras_confirmacion, reintentar_ejecucion, validar_correo_entrante, validar_decisiones,
+    ESQUEMAS, ahora_lima, avanzar_ejecucion, cancelar_ejecucion, iniciar_ejecucion, obtener_cliente_groq,
+    reanudar_tras_confirmacion, reintentar_ejecucion, validar_argumentos, validar_correo_entrante,
+    validar_decisiones,
 )
 from auth import (
     autenticar_usuario, registrar_acceso, registrar_usuario, validar_login, validar_registro,
 )
 from db import (
-    ErrorBaseDatos, cambiar_estado_usuario, cambiar_rol_usuario, cargar_datos_ejemplo,
-    contar_contactos, contar_correos_procesados, contar_reuniones_proximas,
-    contar_tareas_pendientes, init_db, listar_usuarios, listar_usuarios_activos,
-    obtener_actividad_reciente, obtener_estado_usuario, obtener_pasos, obtener_proximas_reuniones,
-    obtener_tareas_pendientes, tiene_datos,
+    ErrorBaseDatos, actualizar_estado_tarea, actualizar_evento, buscar_correos, cambiar_estado_evento,
+    cambiar_estado_usuario, cambiar_rol_usuario, cargar_datos_ejemplo, contar_contactos, contar_correos,
+    contar_correos_procesados, contar_reuniones_proximas, contar_tareas_pendientes, crear_evento_manual,
+    eliminar_correo, init_db, listar_contactos, listar_usuarios, listar_usuarios_activos, marcar_confirmada,
+    obtener_actividad_reciente, obtener_detalle_correo, obtener_estado_usuario, obtener_evento,
+    obtener_eventos_rango, obtener_pasos, obtener_proximas_reuniones, obtener_tareas_pendientes,
+    resumen_correos, tiene_datos,
 )
 from styles import aplicar_estilos
 
@@ -88,6 +94,9 @@ CLAVES_USUARIO = (
     "usuario_id", "usuario_nombre", "usuario_correo", "usuario_rol",
     "alcance_admin", "accion_pendiente", "usuario_gestion", "ejecucion",
     "pc_nombre", "pc_correo", "pc_asunto", "pc_cuerpo",
+    "cal_vista", "cal_fecha", "cal_dia", "cal_form", "cal_cancelar", "cal_responsable",
+    "alcance_calendario", "alcance_correos", "co_texto", "co_estado", "co_desde", "co_hasta",
+    "co_pagina", "co_detalle", "co_confirmar",
 )
 
 
@@ -162,10 +171,10 @@ def es_admin():
 
 
 # Alcance: id propio (usuario) o el elegido por el admin (None = equipo).
-def obtener_alcance():
+def obtener_alcance(clave="alcance_admin"):
     if not es_admin():
         return st.session_state["usuario_id"]
-    elegido = st.session_state.get("alcance_admin")
+    elegido = st.session_state.get(clave)
     return int(elegido) if elegido is not None else None
 
 
@@ -224,8 +233,8 @@ def render_pie():
         '<div><div class="utp-pie-titulo">Módulos</div><div class="utp-pie-lista">'
         '<div>Dashboard <span class="utp-pie-activo">· Activo</span></div>'
         '<div>Procesar correo <span class="utp-pie-activo">· Activo</span></div>'
-        "<div>Calendario <span>· Fase 4</span></div>"
-        "<div>Correos <span>· Fase 5</span></div>"
+        '<div>Calendario <span class="utp-pie-activo">· Activo</span></div>'
+        '<div>Correos <span class="utp-pie-activo">· Activo</span></div>'
         "</div></div>"
         '<div><div class="utp-pie-titulo">Sistema</div><div class="utp-pie-lista">'
         "<div>Uso interno</div>"
@@ -531,21 +540,22 @@ def _html_actividad(correos, mostrar_responsable=False):
     return "".join(filas)
 
 
-# Selector 'Ver datos de:' (solo admin; por defecto todo el equipo).
-def _render_selector_alcance():
+# Selector de alcance (solo admin; por defecto todo el equipo).
+def _render_selector_alcance(etiqueta="Ver datos de:", clave="alcance_admin", al_cambiar=None):
     activos = listar_usuarios_activos()
     nombres = {u["id"]: u["nombre"] for u in activos}
     opciones = [None] + list(nombres)
     # Si el usuario elegido ya no está activo, se vuelve a "Todo el equipo".
-    if st.session_state.get("alcance_admin") not in opciones:
-        st.session_state["alcance_admin"] = None
+    if st.session_state.get(clave) not in opciones:
+        st.session_state[clave] = None
     with st.container(key="selector_alcance"):
         columna, _ = st.columns([1.4, 2.6])
         with columna:
             st.selectbox(
-                "Ver datos de:",
+                etiqueta,
                 opciones,
-                key="alcance_admin",
+                key=clave,
+                on_change=al_cambiar,
                 format_func=lambda v: "Todo el equipo" if v is None else nombres[v],
             )
 
@@ -961,6 +971,11 @@ def _render_acciones_propuestas(run):
         _avanzar_con_spinner(run, reanudar_tras_confirmacion, decisiones)
 
 
+# Escapa HTML y el $ (Streamlit lo interpreta como fórmula).
+def _escapar(texto):
+    return html.escape(texto or "").replace("$", "&#36;")
+
+
 # Resumen del modelo con los títulos de sección destacados.
 def _html_resumen(texto):
     bloques = []
@@ -973,7 +988,7 @@ def _html_resumen(texto):
             bloques.append(f'<div class="utp-resumen-titulo">{seccion.group(1).upper()}</div>')
             linea = seccion.group(2)
         if linea:
-            bloques.append(f"<p>{html.escape(linea)}</p>")
+            bloques.append(f"<p>{_escapar(linea)}</p>")
     return ('<div class="utp-tarjeta utp-tarjeta-ancha utp-resumen">'
             '<div class="utp-tarjeta-titulo">Resumen del asistente</div>' + "".join(bloques) + "</div>")
 
@@ -1016,19 +1031,24 @@ def _json_legible(texto):
         return str(texto)
 
 
+# Pasos de una ejecución en orden: tipo, función, argumentos y resultado.
+def _render_pasos(pasos):
+    for i, paso in enumerate(pasos, 1):
+        funcion = f' · {paso["nombre_funcion"]}' if paso["nombre_funcion"] else ""
+        st.markdown(
+            f'<div class="utp-traza-paso">{i:02d} · {TIPOS_PASO[paso["tipo"]]}{funcion}'
+            f'<span>{paso["fecha"]:%H:%M:%S}</span></div>',
+            unsafe_allow_html=True,
+        )
+        for etiqueta in ("argumentos", "resultado"):
+            if paso[etiqueta]:
+                st.caption(etiqueta.capitalize())
+                st.code(_json_legible(paso[etiqueta]), language="json")
+
+
 def _render_traza(run):
     with st.expander("Ver traza de la ejecución"):
-        for i, paso in enumerate(obtener_pasos(run["ejecucion_id"], st.session_state["usuario_id"]), 1):
-            funcion = f' · {paso["nombre_funcion"]}' if paso["nombre_funcion"] else ""
-            st.markdown(
-                f'<div class="utp-traza-paso">{i:02d} · {TIPOS_PASO[paso["tipo"]]}{funcion}'
-                f'<span>{paso["fecha"]:%H:%M:%S}</span></div>',
-                unsafe_allow_html=True,
-            )
-            for etiqueta in ("argumentos", "resultado"):
-                if paso[etiqueta]:
-                    st.caption(etiqueta.capitalize())
-                    st.code(_json_legible(paso[etiqueta]), language="json")
+        _render_pasos(obtener_pasos(run["ejecucion_id"], st.session_state["usuario_id"]))
 
 
 def _render_completado(run):
@@ -1064,6 +1084,9 @@ def render_procesar():
         run = st.session_state.get("ejecucion")
         if run is None:
             _render_formulario_correo()
+        elif run["estado"] == "en_cola":
+            st.markdown(_html_estado_run("en_cola"), unsafe_allow_html=True)
+            _avanzar_con_spinner(run, avanzar_ejecucion)
         else:
             st.markdown(_html_estado_run(run["estado"]), unsafe_allow_html=True)
             pantallas = {"requiere_accion": _render_acciones_propuestas, "completado": _render_completado,
@@ -1075,28 +1098,732 @@ def render_procesar():
     render_pie()
 
 
-# Página de marcador para módulos pendientes.
-def render_modulo_pendiente(pagina, titulo, fase, descripcion):
+# --- Calendario ---
+VISTAS_CAL = [("mes", "Mes"), ("semana", "Semana"), ("agenda", "Agenda")]
+HORA_INICIO_SEM, HORA_FIN_SEM, PX_HORA = 8, 19, 48
+DIAS_LARGOS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+ESTADOS_EVENTO = {"confirmada": "Confirmada", "por-confirmar": "Por confirmar",
+                  "realizada": "Realizada", "cancelada": "Cancelada"}
+CAMPOS_REUNION = {"titulo": "título", "descripcion": "descripción", "fecha_inicio": "fecha y hora",
+                  "duracion_minutos": "duración", "parámetro": "campo"}
+HTML_LEYENDA = '<div class="utp-cal-leyenda">' + "".join(
+    f'<span><i class="utp-ev utp-ev-{c}"></i>{t}</span>' for c, t in ESTADOS_EVENTO.items()) + "</div>"
+
+
+def _hoy_lima():
+    return ahora_lima().date()
+
+
+def _lunes(dia):
+    return dia - timedelta(days=dia.weekday())
+
+
+def _inicio_dia(dia):
+    return datetime.combine(dia, dtime())
+
+
+def _fecha_larga(dia, anio=False):
+    return f"{dia.day} de {MESES_ES[dia.month - 1]}" + (f" de {dia.year}" if anio else "")
+
+
+# Rango [desde, hasta) de fechas que muestra la vista.
+def _rango_vista(vista, ref):
+    if vista == "mes":
+        primero = ref.replace(day=1)
+        ultimo = (primero + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        return _lunes(primero), _lunes(ultimo) + timedelta(days=7)
+    if vista == "semana":
+        return _lunes(ref), _lunes(ref) + timedelta(days=7)
+    return ref, ref + timedelta(days=30)
+
+
+def _titulo_periodo(vista, ref):
+    if vista == "mes":
+        return f"{MESES_ES[ref.month - 1].capitalize()} de {ref.year}"
+    desde, hasta = _rango_vista(vista, ref)
+    fin = hasta - timedelta(days=1)
+    if vista == "semana":
+        if desde.month == fin.month:
+            return f"Semana del {desde.day} al {fin.day} de {MESES_ES[fin.month - 1]}"
+        return f"Semana del {_fecha_larga(desde)} al {_fecha_larga(fin)}"
+    return f"Del {_fecha_larga(desde)} al {_fecha_larga(fin, anio=True)}"
+
+
+def _inicializar_calendario():
+    hoy = _hoy_lima()
+    st.session_state.setdefault("cal_vista", "mes")
+    st.session_state.setdefault("cal_fecha", hoy)
+    st.session_state.setdefault("cal_dia", hoy)
+
+
+# Callbacks de navegación: -1 anterior, 0 hoy, +1 siguiente.
+def _mover_calendario(paso):
+    vista, ref, hoy = st.session_state["cal_vista"], st.session_state["cal_fecha"], _hoy_lima()
+    if paso == 0:
+        nueva = hoy
+    elif vista == "mes":
+        primero = ref.replace(day=1)
+        nueva = ((primero + timedelta(days=32)) if paso > 0 else (primero - timedelta(days=1))).replace(day=1)
+        if (nueva.year, nueva.month) == (hoy.year, hoy.month):
+            nueva = hoy
+    else:
+        nueva = ref + timedelta(days=paso * (7 if vista == "semana" else 30))
+    st.session_state["cal_fecha"] = nueva
+    st.session_state["cal_dia"] = nueva
+
+
+def _cambiar_vista(vista):
+    st.session_state["cal_vista"] = vista
+
+
+def _abrir_formulario(valor):
+    st.session_state["cal_form"] = valor
+    st.session_state.pop("cal_cancelar", None)
+
+
+def _cerrar_formulario():
+    st.session_state.pop("cal_form", None)
+
+
+# Clase visual según estado y confirmación.
+def _clase_evento(evento):
+    if evento["estado"] != "programada":
+        return evento["estado"]
+    return "confirmada" if evento["confirmada_por_cliente"] else "por-confirmar"
+
+
+def _recortar(texto, largo):
+    return texto if len(texto) <= largo else texto[: largo - 1] + "…"
+
+
+def _html_mes(eventos, ref, hoy):
+    desde, hasta = _rango_vista("mes", ref)
+    por_dia = {}
+    for e in eventos:
+        por_dia.setdefault(e["fecha_inicio"].date(), []).append(e)
+    celdas = [f'<div class="utp-cal-cab">{d}</div>' for d in DIAS_CORTOS_ES]
+    dia = desde
+    while dia < hasta:
+        clases = ["utp-cal-dia"] + (["otro-mes"] if dia.month != ref.month else []) \
+            + (["finde"] if dia.weekday() >= 5 else []) + (["hoy"] if dia == hoy else [])
+        del_dia = por_dia.get(dia, [])
+        etiquetas = "".join(
+            f'<div class="utp-ev utp-ev-{_clase_evento(e)}" title="{html.escape(e["titulo"])}">'
+            f'{e["fecha_inicio"]:%H:%M} {html.escape(_recortar(e["titulo"], 22))}</div>'
+            for e in del_dia[:3]
+        )
+        if len(del_dia) > 3:
+            etiquetas += f'<div class="utp-cal-mas">+{len(del_dia) - 3} más</div>'
+        celdas.append(f'<div class="{" ".join(clases)}"><div class="utp-cal-num">{dia.day}</div>{etiquetas}</div>')
+        dia += timedelta(days=1)
+    return f'<div class="utp-cal-scroll"><div class="utp-cal-mes">{"".join(celdas)}</div></div>'
+
+
+# Reparte eventos solapados del mismo día en carriles: [(evento, carril, total)].
+def _carriles(eventos):
+    fines, asignados = [], []
+    for e in sorted(eventos, key=lambda x: x["fecha_inicio"]):
+        for i, fin in enumerate(fines):
+            if fin <= e["fecha_inicio"]:
+                fines[i] = e["fecha_fin"]
+                asignados.append((e, i))
+                break
+        else:
+            fines.append(e["fecha_fin"])
+            asignados.append((e, len(fines) - 1))
+    return [(e, i, max(len(fines), 1)) for e, i in asignados]
+
+
+def _html_semana(eventos, ref, hoy):
+    desde, _ = _rango_vista("semana", ref)
+    dias = [desde + timedelta(days=i) for i in range(7)]
+    alto = (HORA_FIN_SEM - HORA_INICIO_SEM) * PX_HORA
+    partes = ['<div class="utp-sem-cab"></div>'] + [
+        f'<div class="utp-sem-cab{" hoy" if d == hoy else ""}">{DIAS_CORTOS_ES[i]} <strong>{d.day}</strong></div>'
+        for i, d in enumerate(dias)
+    ]
+    horas = "".join(f'<div class="utp-sem-hora" style="top:{(h - HORA_INICIO_SEM) * PX_HORA}px">{h:02d}:00</div>'
+                    for h in range(HORA_INICIO_SEM, HORA_FIN_SEM))
+    partes.append(f'<div class="utp-sem-horas" style="height:{alto}px">{horas}</div>')
+    for i, dia in enumerate(dias):
+        base = datetime.combine(dia, dtime(HORA_INICIO_SEM))
+        contenido = ""
+        if i < 5:
+            contenido += (f'<div class="utp-sem-laboral" style="top:{(9 - HORA_INICIO_SEM) * PX_HORA}px;'
+                          f'height:{9 * PX_HORA}px"></div>')
+        del_dia = [e for e in eventos if e["fecha_inicio"].date() == dia]
+        for e, carril, total in _carriles(del_dia):
+            inicio = max(e["fecha_inicio"], base)
+            fin = min(e["fecha_fin"], datetime.combine(dia, dtime(HORA_FIN_SEM)))
+            if fin <= inicio:
+                continue
+            top = (inicio - base).total_seconds() / 3600 * PX_HORA
+            altura = max((fin - inicio).total_seconds() / 3600 * PX_HORA, 22)
+            clase = _clase_evento(e)
+            empresa = f'<em>{html.escape(e["contacto_empresa"])}</em>' if e["contacto_empresa"] else ""
+            marca = '<b class="utp-marca-confirmar">Por confirmar</b>' if clase == "por-confirmar" else ""
+            contenido += (
+                f'<div class="utp-ev utp-ev-{clase} utp-sem-ev" title="{html.escape(e["titulo"])}" '
+                f'style="top:{top:.0f}px;height:{altura:.0f}px;left:calc({100 * carril / total:.2f}% + 2px);'
+                f'width:calc({100 / total:.2f}% - 4px)">'
+                f'<span>{e["fecha_inicio"]:%H:%M}–{e["fecha_fin"]:%H:%M}</span>'
+                f'<strong>{html.escape(e["titulo"])}</strong>{empresa}{marca}</div>'
+            )
+        partes.append(f'<div class="utp-sem-col{" finde" if i >= 5 else ""}" style="height:{alto}px">{contenido}</div>')
+    return f'<div class="utp-cal-scroll"><div class="utp-cal-semana">{"".join(partes)}</div></div>'
+
+
+def _html_meta_evento(e, mostrar_responsable):
+    clase = _clase_evento(e)
+    contacto = " · ".join(html.escape(v) for v in (e["contacto_nombre"], e["contacto_empresa"]) if v)
+    partes = [f"<span>{contacto}</span>" if contacto else "",
+              f'<span class="utp-chip">{e["modalidad"]}</span>',
+              f'<span class="utp-chip utp-chip-{clase}">{ESTADOS_EVENTO[clase]}</span>',
+              f'<span class="utp-responsable">Resp.: {html.escape(e["responsable"])}</span>' if mostrar_responsable else ""]
+    return f'<div class="utp-item-meta">{"".join(partes)}</div>'
+
+
+def _html_agenda(eventos, mostrar_responsable):
+    if not eventos:
+        return f'<div class="utp-agenda-dia">{_html_vacio("No hay reuniones en estos 30 días.")}</div>'
+    grupos = {}
+    for e in eventos:
+        grupos.setdefault(e["fecha_inicio"].date(), []).append(e)
+    bloques = []
+    for dia, lista in grupos.items():
+        filas = "".join(
+            f'<div class="utp-agenda-fila utp-agenda-{_clase_evento(e)}">'
+            f'<div class="utp-agenda-hora">{e["fecha_inicio"]:%H:%M}–{e["fecha_fin"]:%H:%M}</div>'
+            f'<div><div class="utp-item-titulo">{html.escape(e["titulo"])}</div>'
+            f"{_html_meta_evento(e, mostrar_responsable)}</div></div>"
+            for e in lista
+        )
+        bloques.append(f'<div class="utp-agenda-dia"><div class="utp-agenda-fecha">'
+                       f'{DIAS_LARGOS_ES[dia.weekday()].capitalize()} {_fecha_larga(dia)}</div>{filas}</div>')
+    return "".join(bloques)
+
+
+# Acciones de las tarjetas del detalle del día (callback). El servidor valida permisos.
+def _accion_evento(accion, evento_id):
+    actor = st.session_state["usuario_id"]
+    if accion == "pedir_cancelar":
+        st.session_state["cal_cancelar"] = evento_id
+        return
+    st.session_state.pop("cal_cancelar", None)
+    if accion == "volver":
+        return
+    if accion == "confirmar":
+        ok, texto = marcar_confirmada(evento_id, actor)
+    elif accion == "realizada":
+        ok, texto = cambiar_estado_evento(evento_id, "realizada", actor, ahora_lima())
+    else:
+        ok, texto = cambiar_estado_evento(evento_id, "cancelada", actor)
+    st.session_state["flash_cal_ok" if ok else "flash_cal_error"] = texto
+
+
+def _puede_gestionar(evento):
+    return es_admin() or evento["usuario_id"] == st.session_state["usuario_id"]
+
+
+def _render_tarjeta_evento(e, mostrar_responsable):
+    clase, eid = _clase_evento(e), e["id"]
+    etiquetas = ""
+    if e["correo_id"]:
+        etiquetas += '<span class="utp-chip utp-chip-ia">Creada por UTP Assistant</span>'
+    if clase == "por-confirmar":
+        etiquetas += '<span class="utp-marca-confirmar">Por confirmar</span>'
+    lineas = [f'<div class="utp-item-fecha">{formato_fecha_corta(e["fecha_inicio"])} · '
+              f'{e["fecha_inicio"]:%H:%M}–{e["fecha_fin"]:%H:%M}</div>',
+              f'<div class="utp-item-titulo utp-ev-titulo-{clase}">{html.escape(e["titulo"])}</div>',
+              _html_meta_evento(e, mostrar_responsable)]
+    if e["descripcion"]:
+        lineas.append(f'<p class="utp-cal-desc">{html.escape(e["descripcion"])}</p>')
+    if e["correo_asunto"]:
+        lineas.append(f'<div class="utp-cal-origen">Correo de origen: «{html.escape(e["correo_asunto"])}»</div>')
+    if etiquetas:
+        lineas.append(f'<div class="utp-item-meta">{etiquetas}</div>')
+    with st.container(key=f"cal_ev_{eid}"):
+        st.markdown("".join(lineas), unsafe_allow_html=True)
+        if not (_puede_gestionar(e) and e["estado"] == "programada"):
+            return
+        with st.container(horizontal=True, gap="small"):
+            if not e["confirmada_por_cliente"]:
+                st.button("Confirmar con cliente", key=f"cal_conf_{eid}", on_click=_accion_evento, args=("confirmar", eid))
+            st.button("Editar", key=f"cal_edit_{eid}", on_click=_abrir_formulario, args=(eid,))
+            if e["fecha_inicio"] <= ahora_lima():
+                st.button("Marcar como realizada", key=f"cal_real_{eid}", on_click=_accion_evento, args=("realizada", eid))
+            st.button("Cancelar reunión", key=f"cal_canc_{eid}", on_click=_accion_evento, args=("pedir_cancelar", eid))
+        if st.session_state.get("cal_cancelar") == eid:
+            st.warning(f"¿Cancelar la reunión «{e['titulo']}»? Seguirá visible como cancelada.")
+            with st.container(horizontal=True, gap="small"):
+                st.button("Sí, cancelar reunión", key=f"cal_canc_si_{eid}", type="primary",
+                          on_click=_accion_evento, args=("cancelar", eid))
+                st.button("Volver", key=f"cal_canc_no_{eid}", on_click=_accion_evento, args=("volver", eid))
+
+
+def _render_detalle_dia(alcance, mostrar_responsable):
+    st.markdown('<div class="utp-seccion-titulo">Detalle del día</div>', unsafe_allow_html=True)
+    columna, _ = st.columns([1.2, 2.8])
+    with columna:
+        dia = st.date_input("Ver día", key="cal_dia", format="YYYY-MM-DD")
+    eventos = obtener_eventos_rango(alcance, _inicio_dia(dia), _inicio_dia(dia + timedelta(days=1)))
+    st.markdown(f'<div class="utp-cal-dia-titulo">{DIAS_LARGOS_ES[dia.weekday()].capitalize()} '
+                f"{_fecha_larga(dia, anio=True)}</div>", unsafe_allow_html=True)
+    if not eventos:
+        st.markdown(f'<div class="utp-tarjeta utp-tarjeta-ancha">{_html_vacio("No hay reuniones este día.")}</div>',
+                    unsafe_allow_html=True)
+    for e in eventos:
+        _render_tarjeta_evento(e, mostrar_responsable)
+
+
+# Formulario "Nueva reunión" / "Editar" (valida con la misma regla que agendar_reunion).
+def _render_formulario_reunion():
+    actor = st.session_state["usuario_id"]
+    modo = st.session_state["cal_form"]
+    evento = None if modo == "nuevo" else obtener_evento(modo)
+    if modo != "nuevo" and (evento is None or not _puede_gestionar(evento) or evento["estado"] != "programada"):
+        _cerrar_formulario()
+        st.session_state["flash_cal_error"] = "No se puede editar esa reunión."
+        st.rerun()
+
+    if evento:
+        responsable = evento["usuario_id"]
+    elif es_admin():
+        activos = {u["id"]: u["nombre"] for u in listar_usuarios_activos()}
+        ids = list(activos)
+        with st.container(key="cal_responsable_wrap"):
+            responsable = st.selectbox("Responsable", ids, key="cal_responsable",
+                                       index=ids.index(actor) if actor in ids else 0,
+                                       format_func=lambda i: activos[i])
+    else:
+        responsable = actor
+    contactos = {c["id"]: c for c in listar_contactos(responsable)}
+    opciones_contacto = [None] + list(contactos)
+
+    if evento:
+        inicio = evento["fecha_inicio"]
+        duracion = int((evento["fecha_fin"] - evento["fecha_inicio"]).total_seconds() // 60)
+    else:
+        dia = st.session_state.get("cal_dia") or _hoy_lima()
+        inicio, duracion = datetime.combine(max(dia, _hoy_lima()), dtime(10)), 60
+    contacto_actual = evento["contacto_id"] if evento and evento["contacto_id"] in contactos else None
+
+    with st.form("form_reunion"):
+        st.markdown(f'<div class="utp-form-titulo">{"Editar reunión" if evento else "Nueva reunión"}</div>'
+                    '<div class="utp-form-subtitulo">Lunes a viernes, de 09:00 a 18:00 (hora de Lima).</div>',
+                    unsafe_allow_html=True)
+        titulo = st.text_input("Título", evento["titulo"] if evento else "", max_chars=200)
+        descripcion = st.text_area("Descripción", (evento["descripcion"] or "") if evento else "", height=90)
+        c1, c2, c3 = st.columns(3)
+        fecha = c1.date_input("Fecha", inicio.date(), format="YYYY-MM-DD")
+        hora = c2.time_input("Hora de inicio", inicio.time(), step=900)
+        minutos = c3.number_input("Duración (min)", 15, 240, min(max(duracion, 15), 240), 15)
+        c4, c5 = st.columns(2)
+        modalidades = ["virtual", "presencial"]
+        modalidad = c4.selectbox("Modalidad", modalidades, format_func=str.capitalize,
+                                 index=modalidades.index(evento["modalidad"]) if evento else 0)
+        contacto_id = c5.selectbox(
+            "Contacto (opcional)", opciones_contacto, index=opciones_contacto.index(contacto_actual),
+            format_func=lambda i: "Sin contacto" if i is None else " · ".join(
+                v for v in (contactos[i]["nombre"], contactos[i]["empresa"]) if v))
+        col_g, col_c = st.columns(2)
+        guardar = col_g.form_submit_button("Guardar reunión", type="primary", width="stretch")
+        cancelar = col_c.form_submit_button("Cancelar", width="stretch")
+
+    if cancelar:
+        _cerrar_formulario()
+        st.rerun()
+    if not guardar:
+        return
+    argumentos = {
+        "titulo": titulo.strip(), "descripcion": descripcion.strip(),
+        "fecha_inicio": f"{fecha:%Y-%m-%d}T{hora:%H:%M}" if fecha and hora else "",
+        "duracion_minutos": int(minutos), "modalidad": modalidad, "fecha_confirmada_por_cliente": True,
+    }
+    errores = validar_argumentos("agendar_reunion", argumentos, responsable,
+                                 excluir_evento_id=evento["id"] if evento else None)
+    if errores:
+        for campo, nombre in CAMPOS_REUNION.items():
+            errores = [e.replace(campo, nombre) for e in errores]
+        st.error("Revisa los siguientes datos:\n\n" + "\n".join(f"- {e}" for e in errores))
+        return
+    inicio = datetime.strptime(argumentos["fecha_inicio"], "%Y-%m-%dT%H:%M")
+    fin = inicio + timedelta(minutes=argumentos["duracion_minutos"])
+    if evento:
+        ok, texto = actualizar_evento(evento["id"], actor, argumentos["titulo"], argumentos["descripcion"],
+                                      inicio, fin, modalidad, contacto_id)
+    else:
+        ok, resultado = crear_evento_manual(actor, responsable, argumentos["titulo"], argumentos["descripcion"],
+                                            inicio, fin, modalidad, contacto_id)
+        texto = "Reunión creada." if ok else resultado
+    st.session_state["flash_cal_ok" if ok else "flash_cal_error"] = texto
+    if ok:
+        _cerrar_formulario()
+        st.session_state["cal_dia"] = inicio.date()
+    st.rerun()
+
+
+def render_calendario():
+    _inicializar_calendario()
     render_cabecera(meta="UTPConsult · Sistema interno")
-    render_navegacion_interna(pagina)
+    render_navegacion_interna("calendario")
     with st.container(key="contenido"):
+        vista, ref, hoy = st.session_state["cal_vista"], st.session_state["cal_fecha"], _hoy_lima()
         st.markdown(
-            f'<div class="utp-eyebrow">Fase {fase}</div>'
-            f'<div class="utp-titulo">{titulo}</div>'
-            f'<p class="utp-lead">Este módulo estará disponible en la fase {fase}.</p>'
-            f'<p class="utp-panel-texto">{descripcion}</p>',
+            '<div class="utp-eyebrow">Agenda del equipo</div>'
+            '<div class="utp-titulo">Calendario</div>'
+            f'<div class="utp-cal-periodo">{_titulo_periodo(vista, ref)}</div>'
+            f'<style>.st-key-cal_vistas .st-key-cal_vista_{vista} button[data-testid="stBaseButton-tertiary"]'
+            "{border-bottom-color: var(--utp-rojo) !important; color: var(--utp-blanco) !important;}</style>",
             unsafe_allow_html=True,
         )
+        for clave, mostrar in (("flash_cal_ok", st.success), ("flash_cal_error", st.error)):
+            mensaje = st.session_state.pop(clave, None)
+            if mensaje:
+                mostrar(mensaje)
+
+        if es_admin():
+            _render_selector_alcance("Ver calendario de:", "alcance_calendario")
+        alcance = obtener_alcance("alcance_calendario")
+        mostrar_responsable = alcance is None
+
+        with st.container(key="cal_barra", horizontal=True, vertical_alignment="center"):
+            with st.container(key="cal_vistas", horizontal=True, width="content", gap=None):
+                for clave, etiqueta in VISTAS_CAL:
+                    st.button(etiqueta, key=f"cal_vista_{clave}", type="tertiary",
+                              on_click=_cambiar_vista, args=(clave,))
+            with st.container(key="cal_nav", horizontal=True, horizontal_alignment="right",
+                              vertical_alignment="center", gap="small"):
+                st.button("← Anterior", key="cal_ant", type="tertiary", on_click=_mover_calendario, args=(-1,))
+                st.button("Hoy", key="cal_hoy", type="tertiary", on_click=_mover_calendario, args=(0,))
+                st.button("Siguiente →", key="cal_sig", type="tertiary", on_click=_mover_calendario, args=(1,))
+                st.button("Nueva reunión", key="cal_nueva", type="primary", on_click=_abrir_formulario,
+                          args=("nuevo",))
+
+        if st.session_state.get("cal_form"):
+            _render_formulario_reunion()
+
+        desde, hasta = _rango_vista(vista, ref)
+        eventos = obtener_eventos_rango(alcance, _inicio_dia(desde), _inicio_dia(hasta))
+        if vista == "mes":
+            cuerpo = _html_mes(eventos, ref, hoy)
+        elif vista == "semana":
+            cuerpo = _html_semana(eventos, ref, hoy)
+        else:
+            cuerpo = _html_agenda(eventos, mostrar_responsable)
+        st.markdown(f'<div class="utp-cal">{cuerpo}{HTML_LEYENDA}</div>', unsafe_allow_html=True)
+
+        if vista != "agenda":
+            _render_detalle_dia(alcance, mostrar_responsable)
     render_pie()
 
 
-# Módulos pendientes: página → (título, número, descripción).
-MODULOS_PENDIENTES = {
-    "calendario": ("Calendario", 4,
-                   "Consulta y gestiona las reuniones agendadas a partir de los correos."),
-    "correos": ("Correos", 5,
-                "Historial de los correos procesados con su resumen y los elementos creados."),
-}
+# --- Correos ---
+POR_PAGINA = 10
+ETIQUETAS_ESTADO_CORREO = {"": "Todos", "procesado": "Procesado", "pendiente": "Pendiente", "error": "Error"}
+ETIQUETAS_ESTADO_TAREA = {"pendiente": "Pendiente", "en_progreso": "En progreso", "completada": "Completada"}
+COLUMNAS_CSV = ["fecha", "remitente", "correo", "asunto", "estado", "resumen", "tareas", "reuniones",
+                "responsable"]
+
+
+def _reiniciar_pagina():
+    st.session_state["co_pagina"] = 1
+
+
+def _limpiar_filtros():
+    for clave in ("co_texto", "co_estado", "co_desde", "co_hasta"):
+        st.session_state.pop(clave, None)
+    _reiniciar_pagina()
+
+
+def _cambiar_pagina(paso):
+    st.session_state["co_pagina"] = st.session_state.get("co_pagina", 1) + paso
+
+
+def _abrir_detalle(correo_id):
+    st.session_state["co_detalle"] = correo_id
+    st.session_state.pop("co_confirmar", None)
+
+
+def _cerrar_detalle():
+    st.session_state.pop("co_detalle", None)
+    st.session_state.pop("co_confirmar", None)
+
+
+def _filtros_correos():
+    return {"texto": st.session_state.get("co_texto", ""), "estado": st.session_state.get("co_estado", ""),
+            "desde": st.session_state.get("co_desde"), "hasta": st.session_state.get("co_hasta")}
+
+
+def _chip_estado_correo(estado):
+    return f'<span class="utp-chip utp-co-{estado}">{ETIQUETAS_ESTADO_CORREO[estado]}</span>'
+
+
+# CSV de los correos filtrados (sin paginar), en utf-8-sig para Excel.
+def _csv_correos(alcance, filtros):
+    salida = io.StringIO()
+    escritor = csv.writer(salida)
+    escritor.writerow(COLUMNAS_CSV)
+    for c in buscar_correos(alcance, filtros, limite=None):
+        escritor.writerow([f'{c["fecha_recepcion"]:%Y-%m-%d %H:%M}', c["remitente_nombre"] or "",
+                           c["remitente_correo"] or "", c["asunto"] or "", c["estado"], c["resumen"] or "",
+                           c["num_tareas"], c["num_reuniones"], c["responsable"]])
+    return salida.getvalue().encode("utf-8-sig")
+
+
+def _render_filtros_correos(alcance):
+    with st.container(key="co_filtros"):
+        c1, c2, c3, c4 = st.columns([2.2, 1, 1, 1])
+        c1.text_input("Buscar", key="co_texto", placeholder="Asunto, remitente o contenido",
+                      on_change=_reiniciar_pagina)
+        c2.selectbox("Estado", list(ETIQUETAS_ESTADO_CORREO), key="co_estado",
+                     format_func=ETIQUETAS_ESTADO_CORREO.get, on_change=_reiniciar_pagina)
+        c3.date_input("Desde", value=None, key="co_desde", format="YYYY-MM-DD", on_change=_reiniciar_pagina)
+        c4.date_input("Hasta", value=None, key="co_hasta", format="YYYY-MM-DD", on_change=_reiniciar_pagina)
+        with st.container(horizontal=True, gap="small"):
+            st.button("Limpiar filtros", key="co_limpiar", on_click=_limpiar_filtros)
+            st.download_button("Exportar CSV", data=_csv_correos(alcance, _filtros_correos()),
+                               file_name=f"correos_{_hoy_lima():%Y%m%d}.csv", mime="text/csv",
+                               key="co_exportar")
+
+
+def _render_fila_correo(c, mostrar_responsable):
+    remitente = _escapar(c["remitente_nombre"] or "Remitente desconocido")
+    correo = f'<span class="utp-co-correo">{_escapar(c["remitente_correo"])}</span>' if c["remitente_correo"] else ""
+    generados = f'{c["num_tareas"]} tarea{"s" if c["num_tareas"] != 1 else ""} · ' \
+                f'{c["num_reuniones"]} reunión{"es" if c["num_reuniones"] != 1 else ""}'
+    meta = [_chip_estado_correo(c["estado"]), f"<span>{generados}</span>"]
+    if mostrar_responsable:
+        meta.append(f'<span class="utp-responsable">Resp.: {_escapar(c["responsable"])}</span>')
+    with st.container(key=f"co_fila_{c['id']}"):
+        texto, boton = st.columns([5, 1.2], vertical_alignment="center")
+        texto.markdown(
+            f'<div class="utp-item-fecha">{formato_fecha_hora(c["fecha_recepcion"])}</div>'
+            f'<div class="utp-item-titulo">{remitente} {correo}</div>'
+            f'<div class="utp-co-asunto-fila">{_escapar(c["asunto"] or "Sin asunto")}</div>'
+            f'<div class="utp-item-meta">{"".join(meta)}</div>',
+            unsafe_allow_html=True,
+        )
+        boton.button("Ver detalle", key=f"co_ver_{c['id']}", type="tertiary",
+                     on_click=_abrir_detalle, args=(c["id"],))
+
+
+def _render_listado_correos():
+    if es_admin():
+        _render_selector_alcance("Ver correos de:", "alcance_correos", al_cambiar=_reiniciar_pagina)
+    alcance = obtener_alcance("alcance_correos")
+    filtros = _filtros_correos()
+    resumen = resumen_correos(alcance, filtros)
+    st.markdown(_html_metricas([(resumen["total"], "Total"), (resumen["procesado"], "Procesados"),
+                                (resumen["pendiente"], "Pendientes"), (resumen["error"], "Con error")]),
+                unsafe_allow_html=True)
+    _render_filtros_correos(alcance)
+    if filtros["desde"] and filtros["hasta"] and filtros["desde"] > filtros["hasta"]:
+        st.warning("La fecha «Desde» es posterior a «Hasta».")
+
+    total = contar_correos(alcance, filtros)
+    paginas = max(1, math.ceil(total / POR_PAGINA))
+    pagina = min(max(st.session_state.get("co_pagina", 1), 1), paginas)
+    st.session_state["co_pagina"] = pagina
+    correos = buscar_correos(alcance, filtros, POR_PAGINA, (pagina - 1) * POR_PAGINA)
+    if not correos:
+        st.markdown(f'<div class="utp-tarjeta utp-tarjeta-ancha">'
+                    f'{_html_vacio("No hay correos que coincidan con la búsqueda.")}</div>',
+                    unsafe_allow_html=True)
+        return
+    for c in correos:
+        _render_fila_correo(c, alcance is None)
+    with st.container(key="co_paginacion", horizontal=True, horizontal_alignment="center",
+                      vertical_alignment="center", gap="medium"):
+        st.button("← Anterior", key="co_anterior", type="tertiary", disabled=pagina <= 1,
+                  on_click=_cambiar_pagina, args=(-1,))
+        st.markdown(f'<span class="utp-co-pagina">Página {pagina} de {paginas}</span>',
+                    unsafe_allow_html=True)
+        st.button("Siguiente →", key="co_siguiente", type="tertiary", disabled=pagina >= paginas,
+                  on_click=_cambiar_pagina, args=(1,))
+
+
+# Lleva al calendario en la fecha de la reunión (callback).
+def _ver_en_calendario(dia, usuario_id):
+    st.session_state.update(cal_vista="mes", cal_fecha=dia, cal_dia=dia, pagina="calendario")
+    if es_admin():
+        st.session_state["alcance_calendario"] = usuario_id
+
+
+def _cambiar_estado_tarea(tarea_id):
+    ok, texto = actualizar_estado_tarea(tarea_id, st.session_state[f"co_estado_tarea_{tarea_id}"],
+                                        st.session_state["usuario_id"])
+    st.session_state["flash_co_ok" if ok else "flash_co_error"] = texto
+
+
+# Reprocesa el correo: nueva ejecución y a la página de procesar (callback).
+def _reprocesar_correo(correo_id):
+    detalle = obtener_detalle_correo(correo_id, st.session_state["usuario_id"])
+    if not detalle:
+        st.session_state["flash_co_error"] = "No tienes permiso para reprocesar este correo."
+        return
+    correo = detalle["correo"]
+    run = reintentar_ejecucion({"correo_id": correo["id"], "usuario_id": correo["usuario_id"]})
+    _limpiar_procesamiento()
+    st.session_state.update(ejecucion=run, pagina="procesar")
+    _cerrar_detalle()
+
+
+def _eliminar_correo(correo_id):
+    ok, texto = eliminar_correo(correo_id, st.session_state["usuario_id"])
+    st.session_state["flash_co_ok" if ok else "flash_co_error"] = texto
+    if ok:
+        _cerrar_detalle()
+
+
+def _confirmar_accion(accion):
+    st.session_state["co_confirmar"] = accion
+
+
+def _render_acciones_correo(detalle):
+    correo = detalle["correo"]
+    cid = correo["id"]
+    confirmar = st.session_state.get("co_confirmar")
+    with st.container(horizontal=True, gap="small"):
+        if correo["estado"] in ("pendiente", "error"):
+            if detalle["tareas"] or detalle["reuniones"]:
+                st.button("Reprocesar", key="co_reprocesar", type="primary", on_click=_confirmar_accion,
+                          args=("reprocesar",))
+            else:
+                st.button("Reprocesar", key="co_reprocesar", type="primary", on_click=_reprocesar_correo,
+                          args=(cid,))
+        st.button("Eliminar correo", key="co_eliminar", on_click=_confirmar_accion, args=("eliminar",))
+    if confirmar == "reprocesar":
+        st.warning("Este correo ya generó acciones. Reprocesarlo puede crear duplicados.")
+        with st.container(horizontal=True, gap="small"):
+            st.button("Sí, reprocesar", key="co_reprocesar_si", type="primary", on_click=_reprocesar_correo,
+                      args=(cid,))
+            st.button("Volver", key="co_reprocesar_no", on_click=_confirmar_accion, args=(None,))
+    elif confirmar == "eliminar":
+        st.warning("¿Eliminar este correo? Sus tareas, reuniones y el contacto se conservan (quedan sin "
+                   "correo de origen); sus ejecuciones y la traza se eliminan. No se puede deshacer.")
+        with st.container(horizontal=True, gap="small"):
+            st.button("Sí, eliminar correo", key="co_eliminar_si", type="primary", on_click=_eliminar_correo,
+                      args=(cid,))
+            st.button("Volver", key="co_eliminar_no", on_click=_confirmar_accion, args=(None,))
+
+
+def _html_contacto(contacto):
+    if not contacto:
+        return _html_vacio("Este correo no está vinculado a ningún contacto.")
+    filas = [("Nombre", contacto["nombre"]), ("Empresa", contacto["empresa"]), ("Cargo", contacto["cargo"]),
+             ("Correo", contacto["correo"]), ("Teléfono", contacto["telefono"]),
+             ("Estado en el CRM", (contacto["estado"] or "").capitalize())]
+    return '<div class="utp-co-datos">' + "".join(
+        f"<div><span>{etiqueta}</span>{_escapar(valor)}</div>" for etiqueta, valor in filas if valor) + "</div>"
+
+
+def _render_tareas_correo(tareas):
+    if not tareas:
+        st.markdown(f'<div class="utp-tarjeta utp-tarjeta-ancha">{_html_vacio("Este correo no generó tareas.")}</div>',
+                    unsafe_allow_html=True)
+        return
+    for t in tareas:
+        vence = f'Vence {formato_fecha_corta(t["fecha_limite"])}' if t["fecha_limite"] else "Sin fecha límite"
+        with st.container(key=f"co_tarjeta_tarea_{t['id']}"):
+            texto, estado = st.columns([3, 1.3])
+            texto.markdown(
+                f'<div class="utp-item-titulo">{_escapar(t["titulo"])}</div>'
+                f'<div class="utp-item-meta"><span class="utp-prioridad utp-prioridad-{t["prioridad"]}">'
+                f'{t["prioridad"]}</span><span>{vence}</span></div>'
+                + (f'<p class="utp-cal-desc">{_escapar(t["descripcion"])}</p>' if t["descripcion"] else ""),
+                unsafe_allow_html=True,
+            )
+            opciones = list(ETIQUETAS_ESTADO_TAREA)
+            estado.selectbox("Estado", opciones, index=opciones.index(t["estado"]),
+                             key=f"co_estado_tarea_{t['id']}", format_func=ETIQUETAS_ESTADO_TAREA.get,
+                             on_change=_cambiar_estado_tarea, args=(t["id"],))
+
+
+def _render_reuniones_correo(reuniones):
+    if not reuniones:
+        st.markdown(f'<div class="utp-tarjeta utp-tarjeta-ancha">{_html_vacio("Este correo no generó reuniones.")}</div>',
+                    unsafe_allow_html=True)
+        return
+    for r in reuniones:
+        clase = _clase_evento(r)
+        marca = '<span class="utp-marca-confirmar">Por confirmar</span>' if clase == "por-confirmar" else ""
+        with st.container(key=f"co_tarjeta_reu_{r['id']}"):
+            texto, boton = st.columns([3, 1.3], vertical_alignment="center")
+            texto.markdown(
+                f'<div class="utp-item-fecha">{formato_fecha_corta(r["fecha_inicio"])} · '
+                f'{r["fecha_inicio"]:%H:%M}–{r["fecha_fin"]:%H:%M}</div>'
+                f'<div class="utp-item-titulo utp-ev-titulo-{clase}">{_escapar(r["titulo"])}</div>'
+                f'<div class="utp-item-meta"><span class="utp-chip">{r["modalidad"]}</span>'
+                f'<span class="utp-chip utp-chip-{clase}">{ESTADOS_EVENTO[clase]}</span>{marca}</div>',
+                unsafe_allow_html=True,
+            )
+            boton.button("Ver en calendario", key=f"co_cal_{r['id']}", on_click=_ver_en_calendario,
+                         args=(r["fecha_inicio"].date(), r["usuario_id"]))
+
+
+def _render_detalle_correo(correo_id):
+    st.button("← Volver al listado", key="co_volver", type="tertiary", on_click=_cerrar_detalle)
+    detalle = obtener_detalle_correo(correo_id, st.session_state["usuario_id"])
+    if not detalle:
+        st.error("No tienes acceso a este correo o ya no existe.")
+        return
+    correo = detalle["correo"]
+    remitente = " · ".join(v for v in (correo["remitente_nombre"], correo["remitente_correo"]) if v)
+    st.markdown(
+        f'<div class="utp-co-asunto">{_escapar(correo["asunto"] or "Sin asunto")}</div>'
+        f'<div class="utp-co-cabecera">{_escapar(remitente or "Remitente desconocido")} · '
+        f'{formato_fecha_hora(correo["fecha_recepcion"])} · Resp.: {_escapar(correo["responsable"])}'
+        f"</div>{_chip_estado_correo(correo['estado'])}",
+        unsafe_allow_html=True,
+    )
+    _render_acciones_correo(detalle)
+
+    st.markdown('<div class="utp-seccion-titulo">Correo original</div>', unsafe_allow_html=True)
+    with st.container(key="co_tarjeta_original"):
+        st.code(correo["cuerpo"], language=None, wrap_lines=True)
+
+    resumen = _html_resumen(correo["resumen"]) if correo["resumen"] else (
+        '<div class="utp-tarjeta utp-tarjeta-ancha"><div class="utp-tarjeta-titulo">Resumen del asistente</div>'
+        f'{_html_vacio("Este correo aún no tiene resumen.")}</div>')
+    st.markdown(resumen, unsafe_allow_html=True)
+    st.markdown('<div class="utp-tarjeta utp-tarjeta-ancha"><div class="utp-tarjeta-titulo">Contacto</div>'
+                f'{_html_contacto(detalle["contacto"])}</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="utp-seccion-titulo">Tareas generadas</div>', unsafe_allow_html=True)
+    _render_tareas_correo(detalle["tareas"])
+    st.markdown('<div class="utp-seccion-titulo">Reuniones generadas</div>', unsafe_allow_html=True)
+    _render_reuniones_correo(detalle["reuniones"])
+
+    st.markdown('<div class="utp-seccion-titulo">Traza de ejecución</div>', unsafe_allow_html=True)
+    if not detalle["ejecuciones"]:
+        st.markdown(f'<div class="utp-tarjeta utp-tarjeta-ancha">{_html_vacio("Este correo no tiene ejecuciones.")}</div>',
+                    unsafe_allow_html=True)
+    for ej in detalle["ejecuciones"]:
+        with st.expander(f'Ejecución #{ej["id"]} · {formato_fecha_hora(ej["fecha_inicio"])} · '
+                         f'{ej["estado"].replace("_", " ")} · {ej["iteraciones"]} iteraciones · {ej["modelo"]}'):
+            _render_pasos(ej["pasos"])
+
+
+def render_correos():
+    render_cabecera(meta="UTPConsult · Sistema interno")
+    render_navegacion_interna("correos")
+    with st.container(key="contenido"):
+        st.markdown(
+            '<div class="utp-eyebrow">Historial</div>'
+            '<div class="utp-titulo">Correos</div>'
+            '<p class="utp-subtitulo">Todo lo que llegó de los clientes y lo que el asistente hizo con ello.</p>',
+            unsafe_allow_html=True,
+        )
+        for clave, mostrar in (("flash_co_ok", st.success), ("flash_co_error", st.error)):
+            mensaje = st.session_state.pop(clave, None)
+            if mensaje:
+                mostrar(mensaje)
+        if st.session_state.get("co_detalle"):
+            _render_detalle_correo(st.session_state["co_detalle"])
+        else:
+            _render_listado_correos()
+    render_pie()
 
 
 # --- Main ---
@@ -1119,12 +1846,11 @@ def main():
             "login": render_login,
             "dashboard": render_dashboard,
             "procesar": render_procesar,
+            "calendario": render_calendario,
+            "correos": render_correos,
             "usuarios": render_usuarios,
         }
-        if pagina in MODULOS_PENDIENTES:
-            render_modulo_pendiente(pagina, *MODULOS_PENDIENTES[pagina])
-        else:
-            pantallas[pagina]()
+        pantallas[pagina]()
     except ErrorBaseDatos as error:
         st.error(str(error))
         st.stop()

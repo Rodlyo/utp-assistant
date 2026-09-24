@@ -112,6 +112,7 @@ TABLAS_SQL = [
         estado ENUM('pendiente','procesado','error') NOT NULL DEFAULT 'pendiente',
         fecha_recepcion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         fecha_procesado DATETIME NULL,
+        INDEX idx_correos_usuario_fecha (usuario_id, fecha_recepcion),
         CONSTRAINT fk_correos_usuario FOREIGN KEY (usuario_id)
             REFERENCES usuarios(id) ON DELETE CASCADE,
         CONSTRAINT fk_correos_contacto FOREIGN KEY (contacto_id)
@@ -150,6 +151,7 @@ TABLAS_SQL = [
         fecha_fin DATETIME NOT NULL,
         modalidad ENUM('virtual','presencial') NOT NULL DEFAULT 'virtual',
         estado ENUM('programada','realizada','cancelada') NOT NULL DEFAULT 'programada',
+        confirmada_por_cliente TINYINT(1) NOT NULL DEFAULT 1,
         fecha_creacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         CONSTRAINT fk_eventos_usuario FOREIGN KEY (usuario_id)
             REFERENCES usuarios(id) ON DELETE CASCADE,
@@ -194,25 +196,43 @@ TABLAS_SQL = [
 ]
 
 
-# Columnas de roles que se añaden si faltan (constantes internas).
-COLUMNAS_ROLES_USUARIOS = [
-    ("rol", "ENUM('usuario','administrador') NOT NULL DEFAULT 'usuario'"),
-    ("activo", "TINYINT(1) NOT NULL DEFAULT 1"),
-    ("ultimo_acceso", "DATETIME NULL"),
+# Columnas que se añaden si faltan: (tabla, columna, definición); constantes internas.
+COLUMNAS_MIGRACION = [
+    ("usuarios", "rol", "ENUM('usuario','administrador') NOT NULL DEFAULT 'usuario'"),
+    ("usuarios", "activo", "TINYINT(1) NOT NULL DEFAULT 1"),
+    ("usuarios", "ultimo_acceso", "DATETIME NULL"),
+    ("eventos", "confirmada_por_cliente", "TINYINT(1) NOT NULL DEFAULT 1"),
 ]
 
 
-# Añade las columnas de roles que falten (compatible con MariaDB).
-def _migrar_columnas_usuarios(cursor):
-    for columna, definicion in COLUMNAS_ROLES_USUARIOS:
+# Añade las columnas que falten (comprueba information_schema; compatible con MariaDB).
+def _migrar_columnas(cursor):
+    for tabla, columna, definicion in COLUMNAS_MIGRACION:
         cursor.execute(
             "SELECT COUNT(*) AS total FROM information_schema.COLUMNS "
-            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'usuarios' "
-            "AND COLUMN_NAME = %s",
-            (columna,),
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+            (tabla, columna),
         )
         if cursor.fetchone()["total"] == 0:
-            cursor.execute(f"ALTER TABLE usuarios ADD COLUMN {columna} {definicion}")
+            cursor.execute(f"ALTER TABLE {tabla} ADD COLUMN {columna} {definicion}")
+
+
+# Índices que se crean si faltan: (tabla, índice, columnas); constantes internas.
+INDICES_MIGRACION = [
+    ("correos", "idx_correos_usuario_fecha", "(usuario_id, fecha_recepcion)"),
+]
+
+
+# Crea los índices que falten.
+def _migrar_indices(cursor):
+    for tabla, indice, columnas in INDICES_MIGRACION:
+        cursor.execute(
+            "SELECT COUNT(*) AS total FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND INDEX_NAME = %s",
+            (tabla, indice),
+        )
+        if cursor.fetchone()["total"] == 0:
+            cursor.execute(f"CREATE INDEX {indice} ON {tabla} {columnas}")
 
 
 # Sin administradores: promueve al usuario de id más bajo.
@@ -254,7 +274,8 @@ def init_db():
             for sentencia in TABLAS_SQL:
                 cursor.execute(sentencia)
             # 3) Migración de columnas y primer administrador.
-            _migrar_columnas_usuarios(cursor)
+            _migrar_columnas(cursor)
+            _migrar_indices(cursor)
             _asegurar_administrador(cursor)
         conexion.commit()
     finally:
@@ -720,11 +741,14 @@ def crear_tarea(usuario_id, correo_id, contacto_id, titulo, descripcion, priorid
 
 
 # Inserta una reunión programada del usuario.
-def crear_evento(usuario_id, correo_id, contacto_id, titulo, descripcion, inicio, fin, modalidad):
+def crear_evento(usuario_id, correo_id, contacto_id, titulo, descripcion, inicio, fin, modalidad,
+                 confirmada=True):
     return _ejecutar(
         "INSERT INTO eventos (usuario_id, correo_id, contacto_id, titulo, descripcion, "
-        "fecha_inicio, fecha_fin, modalidad) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-        (usuario_id, correo_id, contacto_id, titulo, descripcion, inicio, fin, modalidad),
+        "fecha_inicio, fecha_fin, modalidad, confirmada_por_cliente) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (usuario_id, correo_id, contacto_id, titulo, descripcion, inicio, fin, modalidad,
+         1 if confirmada else 0),
     )
 
 
@@ -778,3 +802,258 @@ def obtener_pasos(ejecucion_id, usuario_id):
         "WHERE p.ejecucion_id = %s AND e.usuario_id = %s ORDER BY p.id",
         (ejecucion_id, usuario_id),
     )
+
+
+# --- Calendario ---
+# Campos de un evento con contacto, responsable y asunto del correo de origen.
+_SELECT_EVENTO = (
+    "SELECT e.id, e.usuario_id, e.correo_id, e.contacto_id, e.titulo, e.descripcion, "
+    "       e.fecha_inicio, e.fecha_fin, e.modalidad, e.estado, e.confirmada_por_cliente, "
+    "       c.nombre AS contacto_nombre, c.empresa AS contacto_empresa, "
+    "       u.nombre AS responsable, co.asunto AS correo_asunto "
+    "FROM eventos e "
+    "JOIN usuarios u ON u.id = e.usuario_id "
+    "LEFT JOIN contactos c ON c.id = e.contacto_id "
+    "LEFT JOIN correos co ON co.id = e.correo_id "
+)
+
+
+# Eventos (todos los estados) que se cruzan con [desde, hasta), según el alcance.
+def obtener_eventos_rango(alcance_usuario_id, fecha_desde, fecha_hasta):
+    condicion, params = _filtro_alcance(alcance_usuario_id, "e")
+    return _consultar(
+        _SELECT_EVENTO + f"WHERE {condicion} AND e.fecha_inicio < %s AND e.fecha_fin > %s "
+        "ORDER BY e.fecha_inicio, e.id",
+        params + (fecha_hasta, fecha_desde),
+    )
+
+
+# Un evento con sus datos relacionados (None si no existe).
+def obtener_evento(evento_id):
+    return _consultar(_SELECT_EVENTO + "WHERE e.id = %s", (evento_id,), uno=True)
+
+
+# Reuniones programadas del usuario que se solapan con [inicio, fin).
+def existe_cruce(usuario_id, fecha_inicio, fecha_fin, excluir_evento_id=None):
+    return _consultar(
+        "SELECT id, titulo, fecha_inicio, fecha_fin FROM eventos "
+        "WHERE usuario_id = %s AND estado = 'programada' "
+        "AND fecha_inicio < %s AND fecha_fin > %s AND id <> %s "
+        "ORDER BY fecha_inicio",
+        (usuario_id, fecha_fin, fecha_inicio, excluir_evento_id or 0),
+    )
+
+
+# Contactos del CRM de un usuario (para el selector del formulario).
+def listar_contactos(usuario_id):
+    return _consultar(
+        "SELECT id, nombre, empresa FROM contactos WHERE usuario_id = %s ORDER BY nombre",
+        (usuario_id,),
+    )
+
+
+# True si el actor (activo) es el dueño o un administrador.
+def _actor_autorizado(actor_id, dueno_id):
+    actor = _consultar("SELECT rol, activo FROM usuarios WHERE id = %s", (actor_id,), uno=True)
+    return bool(actor and actor["activo"] and (actor_id == dueno_id or actor["rol"] == "administrador"))
+
+
+# Evento que el actor puede gestionar, o None (no existe o sin permiso).
+def _evento_gestionable(evento_id, actor_id):
+    evento = obtener_evento(evento_id)
+    if evento and _actor_autorizado(actor_id, evento["usuario_id"]):
+        return evento
+    return None
+
+
+# El contacto debe pertenecer al responsable de la reunión.
+def _contacto_de(usuario_id, contacto_id):
+    if not contacto_id:
+        return None
+    fila = _consultar("SELECT id FROM contactos WHERE id = %s AND usuario_id = %s",
+                      (contacto_id, usuario_id), uno=True)
+    return fila["id"] if fila else None
+
+
+# Crea una reunión manual (confirmada, sin correo de origen). Devuelve (ok, mensaje o id).
+def crear_evento_manual(actor_id, usuario_id, titulo, descripcion, inicio, fin, modalidad,
+                        contacto_id=None):
+    if not _actor_autorizado(actor_id, usuario_id):
+        return False, "No tienes permiso para crear reuniones para ese usuario."
+    evento_id = crear_evento(usuario_id, None, _contacto_de(usuario_id, contacto_id), titulo,
+                             descripcion, inicio, fin, modalidad, confirmada=True)
+    return True, evento_id
+
+
+# Edita una reunión programada. Devuelve (ok, mensaje).
+def actualizar_evento(evento_id, actor_id, titulo, descripcion, inicio, fin, modalidad,
+                      contacto_id=None):
+    evento = _evento_gestionable(evento_id, actor_id)
+    if not evento:
+        return False, "No tienes permiso para modificar esta reunión."
+    if evento["estado"] != "programada":
+        return False, "Solo se pueden editar reuniones programadas."
+    _ejecutar(
+        "UPDATE eventos SET titulo = %s, descripcion = %s, fecha_inicio = %s, fecha_fin = %s, "
+        "modalidad = %s, contacto_id = %s WHERE id = %s",
+        (titulo, descripcion, inicio, fin, modalidad,
+         _contacto_de(evento["usuario_id"], contacto_id), evento_id),
+    )
+    return True, "Reunión actualizada."
+
+
+# Cambia el estado ('realizada' solo si ya empezó). Devuelve (ok, mensaje).
+def cambiar_estado_evento(evento_id, estado, actor_id, ahora=None):
+    if estado not in ("realizada", "cancelada"):
+        return False, "Estado no válido."
+    evento = _evento_gestionable(evento_id, actor_id)
+    if not evento:
+        return False, "No tienes permiso para modificar esta reunión."
+    if evento["estado"] != "programada":
+        return False, "La reunión ya no está programada."
+    if estado == "realizada" and evento["fecha_inicio"] > (ahora or datetime.now()):
+        return False, "Solo se puede marcar como realizada una reunión que ya empezó."
+    _ejecutar("UPDATE eventos SET estado = %s WHERE id = %s", (estado, evento_id))
+    return True, "Reunión marcada como realizada." if estado == "realizada" else "Reunión cancelada."
+
+
+# Marca la reunión como confirmada por el cliente. Devuelve (ok, mensaje).
+def marcar_confirmada(evento_id, actor_id):
+    evento = _evento_gestionable(evento_id, actor_id)
+    if not evento:
+        return False, "No tienes permiso para modificar esta reunión."
+    if evento["estado"] != "programada":
+        return False, "La reunión ya no está programada."
+    _ejecutar("UPDATE eventos SET confirmada_por_cliente = 1 WHERE id = %s", (evento_id,))
+    return True, "Reunión confirmada con el cliente."
+
+
+# --- Historial de correos ---
+ESTADOS_CORREO = ("pendiente", "procesado", "error")
+ESTADOS_TAREA = ("pendiente", "en_progreso", "completada")
+
+
+# Escapa los comodines de LIKE para buscar % y _ como texto.
+def _escapar_like(texto):
+    return texto.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# WHERE y parámetros según alcance y filtros (texto, estado, desde, hasta).
+def _condiciones_correos(alcance_usuario_id, filtros):
+    condicion, params = _filtro_alcance(alcance_usuario_id, "co")
+    partes, valores = [condicion], list(params)
+    texto = (filtros.get("texto") or "").strip()
+    if texto:
+        patron = f"%{_escapar_like(texto)}%"
+        partes.append("(co.asunto LIKE %s OR co.cuerpo LIKE %s "
+                      "OR co.remitente_nombre LIKE %s OR co.remitente_correo LIKE %s)")
+        valores += [patron] * 4
+    if filtros.get("estado") in ESTADOS_CORREO:
+        partes.append("co.estado = %s")
+        valores.append(filtros["estado"])
+    if filtros.get("desde"):
+        d = filtros["desde"]
+        partes.append("co.fecha_recepcion >= %s")
+        valores.append(datetime(d.year, d.month, d.day))
+    if filtros.get("hasta"):
+        h = filtros["hasta"]
+        partes.append("co.fecha_recepcion < %s")
+        valores.append(datetime(h.year, h.month, h.day) + timedelta(days=1))
+    return " AND ".join(partes), tuple(valores)
+
+
+# Correos filtrados (más recientes primero); limite=None devuelve todos (exportación).
+def buscar_correos(alcance_usuario_id, filtros, limite=10, desplazamiento=0):
+    condicion, params = _condiciones_correos(alcance_usuario_id, filtros)
+    sql = (
+        "SELECT co.id, co.usuario_id, co.remitente_nombre, co.remitente_correo, co.asunto, "
+        "       co.estado, co.resumen, co.fecha_recepcion, co.fecha_procesado, "
+        "       u.nombre AS responsable, "
+        "       (SELECT COUNT(*) FROM tareas t WHERE t.correo_id = co.id) AS num_tareas, "
+        "       (SELECT COUNT(*) FROM eventos e WHERE e.correo_id = co.id) AS num_reuniones, "
+        "       (SELECT ej.estado FROM ejecuciones ej WHERE ej.correo_id = co.id "
+        "        ORDER BY ej.id DESC LIMIT 1) AS ultima_ejecucion "
+        "FROM correos co JOIN usuarios u ON u.id = co.usuario_id "
+        f"WHERE {condicion} ORDER BY co.fecha_recepcion DESC, co.id DESC"
+    )
+    if limite is not None:
+        sql += " LIMIT %s OFFSET %s"
+        params += (int(limite), int(desplazamiento))
+    return _consultar(sql, params)
+
+
+# Total de correos filtrados (para la paginación).
+def contar_correos(alcance_usuario_id, filtros):
+    condicion, params = _condiciones_correos(alcance_usuario_id, filtros)
+    return _contar(f"SELECT COUNT(*) AS total FROM correos co WHERE {condicion}", params)
+
+
+# Cantidades por estado de los correos filtrados.
+def resumen_correos(alcance_usuario_id, filtros):
+    condicion, params = _condiciones_correos(alcance_usuario_id, filtros)
+    fila = _consultar(
+        "SELECT COUNT(*) AS total, "
+        "       COALESCE(SUM(co.estado = 'procesado'), 0) AS procesado, "
+        "       COALESCE(SUM(co.estado = 'pendiente'), 0) AS pendiente, "
+        "       COALESCE(SUM(co.estado = 'error'), 0) AS error "
+        f"FROM correos co WHERE {condicion}",
+        params, uno=True,
+    )
+    return {clave: int(valor) for clave, valor in fila.items()}
+
+
+# Correo con contacto, tareas, reuniones y ejecuciones (con pasos); None sin permiso.
+def obtener_detalle_correo(correo_id, actor_id):
+    correo = _consultar(
+        "SELECT co.*, u.nombre AS responsable FROM correos co "
+        "JOIN usuarios u ON u.id = co.usuario_id WHERE co.id = %s",
+        (correo_id,), uno=True,
+    )
+    if not correo or not _actor_autorizado(actor_id, correo["usuario_id"]):
+        return None
+    contacto = None
+    if correo["contacto_id"]:
+        contacto = _consultar("SELECT id, nombre, empresa, cargo, correo, telefono, estado "
+                              "FROM contactos WHERE id = %s", (correo["contacto_id"],), uno=True)
+    tareas = _consultar(
+        "SELECT id, titulo, descripcion, prioridad, estado, fecha_limite FROM tareas "
+        "WHERE correo_id = %s ORDER BY FIELD(prioridad, 'urgente', 'alta', 'media', 'baja'), id",
+        (correo_id,),
+    )
+    reuniones = _consultar(_SELECT_EVENTO + "WHERE e.correo_id = %s ORDER BY e.fecha_inicio",
+                           (correo_id,))
+    ejecuciones = _consultar(
+        "SELECT id, estado, iteraciones, modelo, error, fecha_inicio, fecha_fin FROM ejecuciones "
+        "WHERE correo_id = %s ORDER BY id DESC",
+        (correo_id,),
+    )
+    pasos = _consultar(
+        "SELECT p.id, p.ejecucion_id, p.tipo, p.nombre_funcion, p.argumentos, p.resultado, p.fecha "
+        "FROM pasos_ejecucion p JOIN ejecuciones ej ON ej.id = p.ejecucion_id "
+        "WHERE ej.correo_id = %s ORDER BY p.id",
+        (correo_id,),
+    )
+    for ejecucion in ejecuciones:
+        ejecucion["pasos"] = [paso for paso in pasos if paso["ejecucion_id"] == ejecucion["id"]]
+    return {"correo": correo, "contacto": contacto, "tareas": tareas,
+            "reuniones": reuniones, "ejecuciones": ejecuciones}
+
+
+# Cambia el estado de una tarea (dueño o administrador). Devuelve (ok, mensaje).
+def actualizar_estado_tarea(tarea_id, estado, actor_id):
+    if estado not in ESTADOS_TAREA:
+        return False, "Estado de tarea no válido."
+    tarea = _consultar("SELECT usuario_id FROM tareas WHERE id = %s", (tarea_id,), uno=True)
+    if not tarea or not _actor_autorizado(actor_id, tarea["usuario_id"]):
+        return False, "No tienes permiso para modificar esta tarea."
+    _ejecutar("UPDATE tareas SET estado = %s WHERE id = %s", (estado, tarea_id))
+    return True, "Estado de la tarea actualizado."
+
+
+# Elimina el correo: tareas, reuniones y contactos se conservan; ejecuciones y pasos no.
+def eliminar_correo(correo_id, actor_id):
+    correo = _consultar("SELECT usuario_id FROM correos WHERE id = %s", (correo_id,), uno=True)
+    if not correo or not _actor_autorizado(actor_id, correo["usuario_id"]):
+        return False, "No tienes permiso para eliminar este correo."
+    _ejecutar("DELETE FROM correos WHERE id = %s", (correo_id,))
+    return True, "Correo eliminado. Sus tareas y reuniones se conservaron."
